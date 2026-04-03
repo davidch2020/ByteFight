@@ -1,0 +1,5 @@
+3600-agents/matches/
+.venv/
+__pycache__/
+*/__pycache__/
+*/*.pyc
