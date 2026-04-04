@@ -105,6 +105,7 @@ class PlayerAgent:
             if score > best_score:
                 best_score = score
                 best_move = move
+        
 
         if best_move is not None:
             return best_move
