@@ -2,7 +2,7 @@
 
 ## Status
 
-Last updated: 2026-04-04 12:45 EDT
+Last updated: 2026-04-05 15:10 EDT
 
 Current goal: get a scrimmage-ready AI tournament bot by April 5.
 
@@ -10,11 +10,11 @@ Current goal: get a scrimmage-ready AI tournament bot by April 5.
 
 - `3600-agents/Yolanda/agent.py`
   - Main working bot.
-  - Current main line matches `YolandaV3`.
   - Uses:
     - rat belief tracking with transition + sensor updates
     - conservative search with a fixed probability threshold
-    - 1-ply movement heuristic with opponent-aware mobility penalty
+    - depth-2 minimax for movement selection
+    - heuristic leaf evaluation over score gain, carpet potential, and mobility
 - `3600-agents/YolandaV1/agent.py`
   - Snapshot baseline of the earlier rule-based version.
   - Preferred non-`roll_length == 1` carpets, then prime, then fallback random.
@@ -39,15 +39,20 @@ Current goal: get a scrimmage-ready AI tournament bot by April 5.
 - Created `YolandaV2` and `YolandaV3` as stronger checkpoints during iterative tuning.
 - Added rat belief tracking and a conservative search rule to `Yolanda`.
 - Added a lightweight opponent-aware movement heuristic.
+- Refactored `play()` into smaller helpers for belief update, search choice, and movement choice.
+- Prototyped depth-2 and depth-3 minimax movement search in `Yolanda`.
 
 ## Recent Test Results
 
 - `Yolanda` strongly beats `RandomAgent` in both seat orders.
 - `Yolanda` beats `YolandaV2` on larger batch samples.
 - The EV-based search experiment underperformed and was reverted.
+- Depth-2 minimax appears to be a modest improvement over `YolandaV3` in larger samples.
+- Depth-3 minimax did not improve over depth-2.
+- Recent heuristic tweaks were mixed; small coefficient changes still swing results noticeably.
 - Current conclusion:
-  - `YolandaV3` behavior is the strongest local version so far.
-  - Current `Yolanda` is set back to that stable checkpoint.
+  - `YolandaV3` remains the strongest simple threshold-search checkpoint.
+  - Current `Yolanda` is an experimental minimax branch that looks promising but not decisively better yet.
 
 ## Useful Commands
 
@@ -74,5 +79,6 @@ python run_many.py Yolanda YolandaV2 -n 10
 ## Next Steps
 
 - Test against George when available.
-- Tune heuristics only when batch data shows a clear benefit.
+- Compare the minimax branch against stronger reference bots.
+- Tune leaf heuristics only when batch data shows a clear benefit.
 - Keep `YolandaV3` as the fallback checkpoint while experimenting.
