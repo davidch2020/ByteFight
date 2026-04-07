@@ -7,7 +7,7 @@ from game import board, move, enums, rat
 from game.move import Move
 
 SEARCH_PROB_THRESHOLD = 0.55
-MINIMAX_DEPTH = 5
+MINIMAX_DEPTH = 4
 
 
 class PlayerAgent:
@@ -109,32 +109,13 @@ class PlayerAgent:
 
         return None
 
-    def move_order_score(self, move):
-        if move.move_type == enums.MoveType.CARPET:
-            return 100 + move.roll_length
-        if move.move_type == enums.MoveType.PRIME:
-            return 50
-        if move.move_type == enums.MoveType.PLAIN:
-            return 0
-        return -100
-
-    def get_ordered_forecasts(self, candidate_moves: List[Move], strong_moves_first: bool = True) -> List[Tuple[float, Move]]:
-        forecasts = []
-        for move in candidate_moves:
-            score = self.move_order_score(move)
-            forecasts.append((score, move))
-        forecasts.sort(key=lambda x: x[0], reverse=strong_moves_first)
-        return forecasts
-
     def choose_best_movement_move(self, board: board.Board):
         candidate_moves = board.get_valid_moves()
         best_move = None
         best_score = float('-inf')
         current_points = board.player_worker.get_points()
 
-        forecasts = self.get_ordered_forecasts(candidate_moves, strong_moves_first=True)
-
-        for score, move in forecasts:
+        for move in candidate_moves:
             next_board = board.forecast_move(move)
             if next_board is None:
                 continue
@@ -143,9 +124,7 @@ class PlayerAgent:
 
             move_value = self.minimax_value(
                 next_board,
-                alpha = float('-inf'),
-                beta = float('inf'),
-                current_points=current_points,
+                current_points,
                 depth=MINIMAX_DEPTH,
                 maximizing_player=False
             )  # Look ahead 2 moves (1 for opponent, 1 for player) using minimax
@@ -159,7 +138,7 @@ class PlayerAgent:
 
         return random.choice(candidate_moves)
 
-    def minimax_value(self, board: board.Board, alpha:float, beta:float, current_points: int, depth: int, maximizing_player: bool) -> float:
+    def minimax_value(self, board: board.Board, current_points: int, depth: int, maximizing_player: bool) -> float:
         if depth == 0:
             if maximizing_player == False:
                 board.reverse_perspective()  # Switch perspective back to player's point of view before evaluating
@@ -171,41 +150,29 @@ class PlayerAgent:
                 board.reverse_perspective()
             return self.evaluate_board(board, current_points)
 
-        # Order strong-looking current-player moves first to improve alpha-beta pruning.
-        forecasts = self.get_ordered_forecasts(candidate_moves, strong_moves_first=True)
-
         if maximizing_player:
             best_eval = float('-inf')
-            for score, move in forecasts:
+            for move in candidate_moves:
                 next_board = board.forecast_move(move)
                 if next_board is None:
                     continue
                 next_board.reverse_perspective()  # Switch perspective to evaluate from opponent's point of view
-
-                eval = self.minimax_value(next_board, alpha, beta, current_points, depth - 1, False)
+                eval = self.minimax_value(next_board, current_points, depth - 1, False)
                 best_eval = max(best_eval, eval)
-                if best_eval >= beta:
-                    return best_eval  # Beta cut-off
-
-                alpha = max(alpha, best_eval)
 
             return best_eval
         else:
             best_eval = float('inf')
-            for score, move in forecasts:
+            for move in candidate_moves:
                 next_board = board.forecast_move(move)
                 if next_board is None:
                     continue
                 next_board.reverse_perspective()  # Switch perspective to evaluate from opponent's point of view
-
-                eval = self.minimax_value(next_board, alpha, beta, current_points, depth - 1, True)
+                eval = self.minimax_value(next_board, current_points, depth - 1, True)
                 best_eval = min(best_eval, eval)
-                if best_eval <= alpha:
-                    return best_eval  # Alpha cut-off
-
-                beta = min(beta, best_eval)
 
             return best_eval
+
 
     def evaluate_board(self, board: board.Board, current_points: int) -> float:
         new_points = board.player_worker.get_points()
