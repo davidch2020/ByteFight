@@ -2,7 +2,7 @@
 
 ## Status
 
-Last updated: 2026-04-06 EDT
+Last updated: 2026-04-07 EDT
 
 Current goal: keep `Yolanda` as the active tournament bot while preserving stable checkpoints for safe rollback and teammate experiments.
 
@@ -15,7 +15,8 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
     - conservative search with a fixed probability threshold
     - depth-5 minimax for movement selection
     - alpha-beta pruning with lightweight move ordering
-    - heuristic leaf evaluation over score gain, carpet potential, and mobility
+    - `time_left` depth fallback for safer late-game search
+    - heuristic leaf evaluation over score margin, carpet potential, opponent potential, and mobility
 - `3600-agents/YolandaV1/agent.py`
   - Snapshot baseline of the earlier rule-based version.
   - Preferred non-`roll_length == 1` carpets, then prime, then fallback random.
@@ -52,6 +53,9 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
 - Prototyped minimax movement search and moved the active branch to depth 5.
 - Added alpha-beta pruning and lightweight move ordering to make deeper search more practical.
 - Added `depth_sweep.py` for controlled minimax-depth experiments with elapsed-time reporting.
+- Added a `time_left` depth selector so the active bot can reduce minimax depth when the remaining time budget gets lower.
+- Updated the carpet heuristic to use the actual `CARPET_POINTS_TABLE` instead of raw `roll_length`.
+- Tested a generalized opponent-potential leaf heuristic; early results are mixed, so it should be kept under watch before freezing another checkpoint.
 
 ## Recent Test Results
 
@@ -61,11 +65,13 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
 - Depth-4 minimax beat `YolandaV3` in a larger confirmation sample and was saved as `YolandaV4`.
 - Alpha-beta pruning reduced depth-4 runtime in a timed comparison while keeping performance in the same range.
 - Current depth-5 `Yolanda` with alpha-beta and move ordering looks competitive with `YolandaV4` and still clearly beats `YolandaV3` in local batches.
+- After adding `time_left` and the carpet-points heuristic, `Yolanda` continued to beat `YolandaV4` in 20-game local samples around the same range as before.
+- A generalized opponent-potential heuristic produced mixed 20-game samples against `YolandaV4`, including `11-9` and `13-7`; this is not clearly better yet.
 - Recent heuristic tweaks were mixed; small coefficient changes still swing results noticeably.
 - Current conclusion:
   - `YolandaV3` remains the strongest simple threshold-search checkpoint.
   - `YolandaV4` is the stable depth-4 minimax checkpoint.
-  - Current `Yolanda` is the active depth-5 alpha-beta branch.
+  - Current `Yolanda` is the active depth-5 alpha-beta branch with `time_left` fallback and experimental heuristic tweaks.
 
 ## Useful Commands
 
@@ -94,8 +100,9 @@ python run_many.py Yolanda YolandaApurbo -n 10
 ## Next Steps
 
 - Test against George when available.
+- Decide whether to keep, reduce, or revert the opponent-potential heuristic after a larger sample.
 - Compare the depth-5 branch against stronger reference bots.
 - Compare `YolandaApurbo` against `Yolanda` before merging any partner changes.
-- Add `time_left` safety if deeper search starts getting too expensive.
+- Consider freezing a `YolandaV5` checkpoint once the current heuristic is stable.
 - Tune leaf heuristics only when batch data shows a clear benefit.
 - Keep `YolandaV4` as the minimax fallback checkpoint while experimenting.

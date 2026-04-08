@@ -66,7 +66,8 @@ class PlayerAgent:
             return search_move
 
         # If search is not confident enough, fall back to board-play heuristics.
-        return self.choose_best_movement_move(board)
+        search_depth = self.choose_minimax_depth(time_left)
+        return self.choose_best_movement_move(board, search_depth)
 
     def normalize_belief(self):
         total = np.sum(self.belief)
@@ -109,6 +110,16 @@ class PlayerAgent:
 
         return None
 
+    def choose_minimax_depth(self, time_left: Callable[[], float]):
+        # TODO: Use the remaining time budget to choose a safe search depth.
+        seconds_left = time_left()
+        if seconds_left > 120:
+            return MINIMAX_DEPTH
+        elif seconds_left > 60:
+            return 4
+        else:
+            return 2
+
     def move_order_score(self, move):
         if move.move_type == enums.MoveType.CARPET:
             return 100 + move.roll_length
@@ -126,7 +137,7 @@ class PlayerAgent:
         forecasts.sort(key=lambda x: x[0], reverse=strong_moves_first)
         return forecasts
 
-    def choose_best_movement_move(self, board: board.Board):
+    def choose_best_movement_move(self, board: board.Board, search_depth: int):
         candidate_moves = board.get_valid_moves()
         best_move = None
         best_score = float('-inf')
@@ -146,7 +157,7 @@ class PlayerAgent:
                 alpha = float('-inf'),
                 beta = float('inf'),
                 current_points=current_points,
-                depth=MINIMAX_DEPTH,
+                depth=search_depth,
                 maximizing_player=False
             )  # Look ahead 2 moves (1 for opponent, 1 for player) using minimax
 
@@ -221,22 +232,22 @@ class PlayerAgent:
         next_moves = board.get_valid_moves()
         carpet_count = 0
         carpet_value = 0
-        largest_carpet_rolls = 0
+        largest_carpet_value = 0
         for move in next_moves:
             if move.move_type == enums.MoveType.CARPET:
-                if move.roll_length == 1:
-                    score -= 1  # Penalize using a carpet of length 1
+                carpet_points = enums.CARPET_POINTS_TABLE[move.roll_length]
+                if move.roll_length != 1:
+                    carpet_count += 1
 
-                carpet_count += 1
-                carpet_value += move.roll_length
+                carpet_value += carpet_points
 
-                if move.roll_length > largest_carpet_rolls:
-                   largest_carpet_rolls = move.roll_length
+                if carpet_points > largest_carpet_value:
+                    largest_carpet_value = carpet_points
 
 
         score += carpet_count * 0.2  # Reward having more carpet moves available
         score += carpet_value * 0.1  # Reward having longer carpet moves available
-        score += largest_carpet_rolls * 0.3  # Reward having the option for a long carpet move
+        score += largest_carpet_value * 0.3  # Reward having the option for a high-value carpet move
 
         # Evaluate mobility for next state based on prime and plain moves
         mobility_score = 0
@@ -247,6 +258,24 @@ class PlayerAgent:
                 mobility_score += 0.2
 
         score += mobility_score * 0.3  # Weight mobility score
+
+        # Penalize score if opponent has strong move available
+        opponent_board = board.get_copy()
+        opponent_board.reverse_perspective()
+        opponent_best_potential = 0
+        for move in opponent_board.get_valid_moves():
+            if move.move_type == enums.MoveType.CARPET:
+                value = enums.CARPET_POINTS_TABLE[move.roll_length]
+            elif move.move_type == enums.MoveType.PRIME:
+                value = 1
+            elif move.move_type == enums.MoveType.PLAIN:
+                value = 0.2
+            else:
+                value = 0
+
+            opponent_best_potential = max(opponent_best_potential, value)
+
+        score -= opponent_best_potential * 0.1
 
         return score
 
