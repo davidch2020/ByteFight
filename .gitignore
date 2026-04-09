@@ -8,3 +8,4 @@ __pycache__/
 *.zip
 depth_sweep.log
 depth_sweep_results.txt
+bot_matches/
