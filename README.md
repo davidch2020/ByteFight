@@ -2,20 +2,20 @@
 
 ## Status
 
-Last updated: 2026-04-07 EDT
+Last updated: 2026-04-08 EDT
 
-Current goal: keep `Yolanda` as the active tournament bot while preserving stable checkpoints for safe rollback and teammate experiments.
+Current goal: keep `YolandaV5` as the stable tournament fallback while using `Yolanda` as the active expectiminimax experiment branch.
 
 ## Current Bot Setup
 
 - `3600-agents/Yolanda/agent.py`
-  - Main working bot.
+  - Main experimental bot.
   - Uses:
     - rat belief tracking with transition + sensor updates
-    - conservative search with a fixed probability threshold
-    - depth-5 minimax for movement selection
-    - alpha-beta pruning with lightweight move ordering
-    - `time_left` depth fallback for safer late-game search
+    - root search chosen by expected value plus a confidence floor
+    - expectiminimax-style movement search with alpha-beta at decision nodes
+    - bounded chance branching over likely rat outcomes
+    - timing instrumentation for per-turn runtime checks
     - heuristic leaf evaluation over score margin, carpet potential, opponent potential, and mobility
 - `3600-agents/YolandaV1/agent.py`
   - Snapshot baseline of the earlier rule-based version.
@@ -27,6 +27,9 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
 - `3600-agents/YolandaV4/agent.py`
   - Frozen checkpoint of the depth-4 minimax version.
   - Useful fallback while testing deeper search and ordering changes.
+- `3600-agents/YolandaV5/agent.py`
+  - Frozen checkpoint of the depth-5 minimax branch with alpha-beta, move ordering, `time_left` fallback, and the carpet-points heuristic.
+  - Current strongest stable local baseline.
 - `3600-agents/YolandaApurbo/agent.py`
   - Partner experiment copy of current `Yolanda`.
   - Use this for Apurbo's independent edits without changing the main bot.
@@ -46,6 +49,7 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
 - Created `YolandaV1` as a saved baseline before moving to the heuristic evaluator.
 - Created `YolandaV2` and `YolandaV3` as stronger checkpoints during iterative tuning.
 - Created `YolandaV4` as the depth-4 minimax checkpoint.
+- Created `YolandaV5` as the frozen depth-5 minimax checkpoint before expectiminimax experimentation.
 - Created `YolandaApurbo` as a partner sandbox copy of the current bot.
 - Added rat belief tracking and a conservative search rule to `Yolanda`.
 - Added a lightweight opponent-aware movement heuristic.
@@ -56,6 +60,11 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
 - Added a `time_left` depth selector so the active bot can reduce minimax depth when the remaining time budget gets lower.
 - Updated the carpet heuristic to use the actual `CARPET_POINTS_TABLE` instead of raw `roll_length`.
 - Tested a generalized opponent-potential leaf heuristic; early results are mixed, so it should be kept under watch before freezing another checkpoint.
+- Prototyped an expectiminimax branch in `Yolanda` with chance nodes over likely rat outcomes and alpha-beta pruning at decision nodes.
+- Reorganized `Yolanda/agent.py` into grouped sections and added plain-English block comments for partner readability.
+- Added per-turn timing output and node-count reporting to help diagnose local search runtime.
+- Updated `run_many.py` to decode subprocess output with replacement so batch tests no longer crash on occasional invalid bytes.
+- Tweaked the local runner/process setup for more reliable local testing on this machine, including a spawn start method and more permissive initialization timing.
 
 ## Recent Test Results
 
@@ -68,10 +77,14 @@ Current goal: keep `Yolanda` as the active tournament bot while preserving stabl
 - After adding `time_left` and the carpet-points heuristic, `Yolanda` continued to beat `YolandaV4` in 20-game local samples around the same range as before.
 - A generalized opponent-potential heuristic produced mixed 20-game samples against `YolandaV4`, including `11-9` and `13-7`; this is not clearly better yet.
 - Recent heuristic tweaks were mixed; small coefficient changes still swing results noticeably.
+- Against the reference bots as Team A:
+  - `George`: `7-2-1`
+  - `Albert`: `3-7`
+- Match review against `Albert` suggests the biggest gap is future carpet conversion and search quality, not opening play.
+- The current expectiminimax branch underperformed badly at first, but tightening root search and fixing local depth handling made it much more competitive with `YolandaV5` in the first 5-game seat-order rerun (`3-1-1` as Player A).
 - Current conclusion:
-  - `YolandaV3` remains the strongest simple threshold-search checkpoint.
-  - `YolandaV4` is the stable depth-4 minimax checkpoint.
-  - Current `Yolanda` is the active depth-5 alpha-beta branch with `time_left` fallback and experimental heuristic tweaks.
+  - `YolandaV5` is the strongest stable fallback checkpoint.
+  - Current `Yolanda` is the active expectiminimax lab branch and still needs more tuning before replacing `YolandaV5`.
 
 ## Useful Commands
 
@@ -93,16 +106,16 @@ Run a batch of matches:
 python run_many.py Yolanda RandomAgent -n 10
 python run_many.py Yolanda YolandaV3 -n 10
 python run_many.py Yolanda YolandaV4 -n 10
+python run_many.py Yolanda YolandaV5 -n 10
 python run_many.py YolandaApurbo Yolanda -n 10
 python run_many.py Yolanda YolandaApurbo -n 10
 ```
 
 ## Next Steps
 
-- Test against George when available.
-- Decide whether to keep, reduce, or revert the opponent-potential heuristic after a larger sample.
-- Compare the depth-5 branch against stronger reference bots.
+- Finish reverse-seat validation of the tightened expectiminimax branch against `YolandaV5`.
+- Reduce unnecessary interior search branching or make branch-level search more selective.
+- Improve future carpet-potential features before pushing expectiminimax depth higher.
+- Compare the current branch against Albert again after the next search/heuristic pass.
 - Compare `YolandaApurbo` against `Yolanda` before merging any partner changes.
-- Consider freezing a `YolandaV5` checkpoint once the current heuristic is stable.
-- Tune leaf heuristics only when batch data shows a clear benefit.
-- Keep `YolandaV4` as the minimax fallback checkpoint while experimenting.
+- Keep `YolandaV5` as the stable fallback while `Yolanda` stays experimental.

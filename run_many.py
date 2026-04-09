@@ -19,6 +19,8 @@ def run_game(player_a: str, player_b: str) -> dict:
         [sys.executable, "engine/run_local_agents.py", player_a, player_b],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     output = strip_ansi(result.stdout)
