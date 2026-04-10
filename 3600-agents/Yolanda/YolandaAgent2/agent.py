@@ -14,6 +14,11 @@ RAT_FIND_PTS = 4
 RAT_MISS_PTS = -2
 SEARCH_PROB_FLOOR = 0.55
 SEARCH_EV_FLOOR = 0.5
+MIDGAME_TURNS_HIGH = 30
+MIDGAME_TURNS_LOW = 12
+MIDGAME_SEARCH_PROB_FLOOR = 0.68
+MIDGAME_SEARCH_EV_FLOOR = 1.4
+MIDGAME_CARPET_BLOCK = 2
 
 TIME_HARD_FLOOR = 1.0
 MAX_DEPTH = 9
@@ -287,7 +292,7 @@ class PlayerAgent:
         beta = float('inf')
 
         # Rat search candidate
-        sm, sev = self._rat_search_ev()
+        sm, sev = self._rat_search_ev(b)
         if sm is not None and sev > best_sc:
             best_sc = sev
             best_move = sm
@@ -309,11 +314,27 @@ class PlayerAgent:
         return best_move, best_sc
 
     # Compute expected value of searching for the rat at its most likely cell. Return the move + EV if worth it.
-    def _rat_search_ev(self):
+    def _rat_search_ev(self, b):
         idx = int(np.argmax(self.belief))
         p = self.belief[idx]
         ev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-        if p >= SEARCH_PROB_FLOOR and ev >= SEARCH_EV_FLOOR:
+
+        prob_floor = SEARCH_PROB_FLOOR
+        ev_floor = SEARCH_EV_FLOOR
+
+        turns = b.player_worker.turns_left
+        best_carpet = 0
+        for m in b.get_valid_moves():
+            if m.move_type == enums.MoveType.CARPET:
+                best_carpet = max(best_carpet, self._cpt[m.roll_length])
+
+        if MIDGAME_TURNS_LOW <= turns <= MIDGAME_TURNS_HIGH:
+            prob_floor = MIDGAME_SEARCH_PROB_FLOOR
+            ev_floor = MIDGAME_SEARCH_EV_FLOOR
+            if best_carpet >= MIDGAME_CARPET_BLOCK:
+                return None, float('-inf')
+
+        if p >= prob_floor and ev >= ev_floor:
             return Move.search(self._loc(idx)), ev
         return None, float('-inf')
 
@@ -339,24 +360,6 @@ class PlayerAgent:
 
         if maximizing:
             best = float('-inf')
-
-            # Rat-search chance node at max nodes
-            idx = int(np.argmax(self.belief))
-            p = self.belief[idx]
-            sev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-            if p >= SEARCH_PROB_FLOOR and sev >= SEARCH_EV_FLOOR:
-                # Search doesn't change the board. The value is:
-                # the expected points from the search (sev) plus
-                # the continuation value where the opponent plays next
-                # on the unchanged board.
-                # To avoid the cost of a recursive call for the search
-                # branch (which would be on the same board), we use the
-                # raw sev as the search value. This is a sound approximation
-                # because the board state is unchanged — only the score shifts.
-                best = max(best, sev)
-                if best >= beta:
-                    return best
-                alpha = max(alpha, best)
 
             for m in ordered:
                 if time_left() < TIME_HARD_FLOOR:
@@ -448,11 +451,43 @@ class PlayerAgent:
             elif m.move_type == enums.MoveType.PLAIN:
                 n_plain += 1
 
-        score += best_carpet * 0.45
-        score += carpet_sum * 0.06
-        score += n_carpet * 0.10
-        score += n_prime * 0.25
-        score += n_plain * 0.04
+        score += best_carpet * 0.60
+        score += carpet_sum * 0.10
+        score += n_carpet * 0.15
+        score += n_prime * 0.10
+        score += n_plain * 0.10
+
+        # Midgame as Player A: push harder on converting initiative into
+        # immediate board value instead of more setup/search.
+        if MIDGAME_TURNS_LOW <= turns <= MIDGAME_TURNS_HIGH:
+            u = (MIDGAME_TURNS_HIGH - turns + 1) / (MIDGAME_TURNS_HIGH - MIDGAME_TURNS_LOW + 1)
+            score += best_carpet * 0.30 * u
+            score += carpet_sum * 0.14 * u
+            score += n_plain * 0.20 * u
+            score -= n_prime * 0.15 * u
+
+        # If a meaningful carpet is already available, bias toward converting
+        # it now instead of continuing to over-prime or over-search.
+        if best_carpet >= 4:
+            score += 0.8
+        if margin > 0 and best_carpet >= 4:
+            score += 0.8
+        if margin > 0 and best_carpet >= 6:
+            score += 1.2
+
+        # Once there is real scoring on the table, make additional priming
+        # much less attractive.
+        prime_penalty = 0.0
+        if best_carpet >= 2:
+            prime_penalty += 0.12
+        if best_carpet >= 4:
+            prime_penalty += 0.18
+        if carpet_sum >= 6:
+            prime_penalty += 0.12
+        if margin > 0 and best_carpet >= 4:
+            prime_penalty += 0.10
+        if prime_penalty > 0:
+            score -= n_prime * prime_penalty
 
         # --- 3. Cell potential (Carrie-style spatial heuristic) ---
         # The precomputed potential map is from the root board state, so it's
