@@ -238,16 +238,9 @@ class PlayerAgent:
         value_board = self.build_value_board(board)
         position_score = self.position_value(value_board, my_pos) * 0.25 - self.position_value(value_board, opp_pos) * 0.1
 
-        # Evaluate opponent's future carpeting potential
-        opponent_board = board.get_copy()
-        opponent_board.reverse_perspective()
-        opponent_best_future = self.best_carpet_points_future(opponent_board)
-        opponent_future_penalty = opponent_best_future * 0.1
-
         score = (
             points_score
             + position_score
-            - opponent_future_penalty
         )
 
         return {
