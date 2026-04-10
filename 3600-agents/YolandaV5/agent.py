@@ -30,6 +30,7 @@ class PlayerAgent:
             self.initial_belief = self.initial_belief @ self.transition_matrix
 
         self.belief = self.initial_belief.copy()
+        self.detected_time_budget = None
 
         pass
 
@@ -113,12 +114,17 @@ class PlayerAgent:
     def choose_minimax_depth(self, time_left: Callable[[], float]):
         # TODO: Use the remaining time budget to choose a safe search depth.
         seconds_left = time_left()
-        if seconds_left > 120:
+        if self.detected_time_budget is None:
+            self.detected_time_budget = seconds_left
+
+        total_time = self.detected_time_budget
+
+        if seconds_left > total_time * 0.7:
             return MINIMAX_DEPTH
-        elif seconds_left > 60:
-            return 4
+        elif seconds_left > total_time * 0.3:
+            return max(1, MINIMAX_DEPTH - 1)
         else:
-            return 2
+            return max(1, MINIMAX_DEPTH - 2)
 
     def move_order_score(self, move):
         if move.move_type == enums.MoveType.CARPET:
