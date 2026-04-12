@@ -19,6 +19,7 @@ TIME_HARD_FLOOR = 2.5
 MAX_DEPTH = 7
 MIN_DEPTH = 3
 
+# Version 7
 
 class PlayerAgent:
     """
