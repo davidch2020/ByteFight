@@ -237,6 +237,7 @@ def play_game(
         init_timeout = 30
         play_time = 60
 
+    play_time = 240
     # setup main thread queue for getting results
     main_q_a = Queue()
     main_q_b = Queue()

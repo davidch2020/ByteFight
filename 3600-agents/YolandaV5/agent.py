@@ -9,6 +9,7 @@ from game.move import Move
 SEARCH_PROB_THRESHOLD = 0.55
 MINIMAX_DEPTH = 5
 
+# Version 5
 
 class PlayerAgent:
     """
