@@ -12,13 +12,8 @@ from game.move import Move
 # ---------------------------------------------------------------------------
 RAT_FIND_PTS = 4
 RAT_MISS_PTS = -2
-SEARCH_PROB_FLOOR = 0.55
-SEARCH_EV_FLOOR = 0.5
-MIDGAME_TURNS_HIGH = 30
-MIDGAME_TURNS_LOW = 12
-MIDGAME_SEARCH_PROB_FLOOR = 0.68
-MIDGAME_SEARCH_EV_FLOOR = 1.4
-MIDGAME_CARPET_BLOCK = 2
+SEARCH_PROB_FLOOR = 0.2
+SEARCH_EV_FLOOR = 0.0
 
 TIME_HARD_FLOOR = 1.0
 MAX_DEPTH = 9
@@ -195,6 +190,7 @@ class PlayerAgent:
                     rD[y][x] = rD[y+1][x] + 1
 
         # Build potential map
+        """
         pot = np.zeros((SZ, SZ), dtype=np.float64)
         cpt = self._cpt
 
@@ -225,12 +221,18 @@ class PlayerAgent:
                     pot[y, x] = best_p * discount
 
                 # CARPET and BLOCKED → 0
+        """
 
-        self._cell_pot = pot
         self._rL = rL
         self._rR = rR
         self._rU = rU
         self._rD = rD
+
+    def _filter_moves(self, moves):
+        filtered = [m for m in moves if not (
+            m.move_type == enums.MoveType.CARPET and m.roll_length == 1
+        )]
+        return filtered if filtered else moves  # safety: don't return empty
 
     # ------------------------------------------------------------------
     # Iterative deepening
@@ -285,18 +287,22 @@ class PlayerAgent:
     # ------------------------------------------------------------------
     # Evaluate all candidate moves (including rat search) at the root and return the best move + score.
     def _root(self, b, cands, root_pts, depth, time_left):
-        ordered = self._order(cands)
+        ordered = self._order(b, self._filter_moves(cands))
         best_move = None
         best_sc = float('-inf')
         alpha = float('-inf')
         beta = float('inf')
 
         # Rat search candidate
-        sm, sev = self._rat_search_ev(b)
-        if sm is not None and sev > best_sc:
-            best_sc = sev
-            best_move = sm
-            alpha = max(alpha, best_sc)
+        sm, sev = self._rat_search_ev()
+        if sm is not None:
+            turns = b.player_worker.turns_left
+            baseline = self._eval(b, root_pts)
+            rat_score = baseline + sev * turns
+            if rat_score > best_sc:
+                best_sc = rat_score
+                best_move = sm
+                alpha = max(alpha, best_sc)
 
         for m in ordered:
             if time_left() < TIME_HARD_FLOOR:
@@ -314,27 +320,11 @@ class PlayerAgent:
         return best_move, best_sc
 
     # Compute expected value of searching for the rat at its most likely cell. Return the move + EV if worth it.
-    def _rat_search_ev(self, b):
+    def _rat_search_ev(self):
         idx = int(np.argmax(self.belief))
         p = self.belief[idx]
         ev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-
-        prob_floor = SEARCH_PROB_FLOOR
-        ev_floor = SEARCH_EV_FLOOR
-
-        turns = b.player_worker.turns_left
-        best_carpet = 0
-        for m in b.get_valid_moves():
-            if m.move_type == enums.MoveType.CARPET:
-                best_carpet = max(best_carpet, self._cpt[m.roll_length])
-
-        if MIDGAME_TURNS_LOW <= turns <= MIDGAME_TURNS_HIGH:
-            prob_floor = MIDGAME_SEARCH_PROB_FLOOR
-            ev_floor = MIDGAME_SEARCH_EV_FLOOR
-            if best_carpet >= MIDGAME_CARPET_BLOCK:
-                return None, float('-inf')
-
-        if p >= prob_floor and ev >= ev_floor:
+        if p >= SEARCH_PROB_FLOOR and ev >= SEARCH_EV_FLOOR:
             return Move.search(self._loc(idx)), ev
         return None, float('-inf')
 
@@ -356,10 +346,33 @@ class PlayerAgent:
                 b.reverse_perspective()
             return self._eval(b, root_pts)
 
-        ordered = self._order(moves)
+        moves = self._filter_moves(moves)  # filter out 1-length carpet rolls
+        ordered = self._order(b, moves)
 
         if maximizing:
             best = float('-inf')
+
+            # Rat-search chance node at max nodes
+            idx = int(np.argmax(self.belief))
+            p = self.belief[idx]
+            sev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
+            if p >= SEARCH_PROB_FLOOR and sev >= SEARCH_EV_FLOOR:
+                # Search doesn't change the board. The value is:
+                # the expected points from the search (sev) plus
+                # the continuation value where the opponent plays next
+                # on the unchanged board.
+                # To avoid the cost of a recursive call for the search
+                # branch (which would be on the same board), we use the
+                # raw sev as the search value. This is a sound approximation
+                # because the board state is unchanged — only the score shifts.
+                
+                turns = b.player_worker.turns_left
+                baseline = self._eval(b, root_pts)
+                scaled_sev = baseline + sev * turns # scale the search EV by turns left to match the magnitude of the leaf evals
+                best = max(best, scaled_sev)
+                if best >= beta:
+                    return best
+                alpha = max(alpha, best)
 
             for m in ordered:
                 if time_left() < TIME_HARD_FLOOR:
@@ -394,7 +407,9 @@ class PlayerAgent:
     # Move ordering
     # ------------------------------------------------------------------
     # Sort moves so carpet rolls come first, then primes, then plains -- helps alpha-beta prune faster.
-    def _order(self, moves):
+    def _order(self, b, moves):
+        current_x, current_y = b.player_worker.get_location()
+
         def key(m):
             if m.move_type == enums.MoveType.CARPET:
                 return (3, self._cpt.get(m.roll_length, 21))
@@ -407,128 +422,91 @@ class PlayerAgent:
                 # not the destination. Since we don't have origin info on
                 # the Move object, use a flat priority. The tree will sort
                 # out the best prime.
-                return (2, 0)
+                horizontal_run = 1 + self._rL[current_y][current_x] + self._rR[current_y][current_x]
+                vertical_run = 1 + self._rU[current_y][current_x] + self._rD[current_y][current_x]
+                run_length_through_current_cell = max(horizontal_run, vertical_run)
+                return (2, run_length_through_current_cell)
             if m.move_type == enums.MoveType.PLAIN:
                 return (1, 0)
             return (0, 0)
         return sorted(moves, key=key, reverse=True)
 
-    # ------------------------------------------------------------------
-    # Heuristic evaluation
-    # ------------------------------------------------------------------
-    # Score a board state: point margin + available carpet value + nearby cell potential + opponent threat - endgame adjustments.
-    def _eval(self, b: board.Board, root_pts: int) -> float:
-        pp = b.player_worker.get_points()
-        op = b.opponent_worker.get_points()
-        ploc = b.player_worker.get_location()
-        oloc = b.opponent_worker.get_location()
+    # Recompute run-length arrays from the actual board state at this node.
+    # This keeps leaf evaluation aligned with the live tree position instead of
+    # relying on the root-turn cache from _precompute().
+    def _build_run_arrays(self, b: board.Board):
+        SZ = self.SZ
+        PRIMED = enums.Cell.PRIMED
+
+        # Build a fresh primed mask from the current board state.
+        is_p = [
+            [b.get_cell((x, y)) == PRIMED for x in range(SZ)]
+            for y in range(SZ)
+        ]
+
+        rL = [[0] * SZ for _ in range(SZ)]
+        rR = [[0] * SZ for _ in range(SZ)]
+        rU = [[0] * SZ for _ in range(SZ)]
+        rD = [[0] * SZ for _ in range(SZ)]
+
+        # Horizontal runs: how many contiguous primed cells extend left/right
+        # from each square, excluding the square itself.
+        for y in range(SZ):
+            for x in range(1, SZ):
+                if is_p[y][x - 1]:
+                    rL[y][x] = rL[y][x - 1] + 1
+            for x in range(SZ - 2, -1, -1):
+                if is_p[y][x + 1]:
+                    rR[y][x] = rR[y][x + 1] + 1
+
+        # Vertical runs: how many contiguous primed cells extend up/down
+        # from each square, excluding the square itself.
+        for x in range(SZ):
+            for y in range(1, SZ):
+                if is_p[y - 1][x]:
+                    rU[y][x] = rU[y - 1][x] + 1
+            for y in range(SZ - 2, -1, -1):
+                if is_p[y + 1][x]:
+                    rD[y][x] = rD[y + 1][x] + 1
+
+        return rL, rR, rU, rD
+
+    def _eval(self, b, root_pts):
+        rL, rR, rU, rD = self._build_run_arrays(b)
+        
+        my_score = b.player_worker.get_points()
+        opp_score = b.opponent_worker.get_points()
         turns = b.player_worker.turns_left
-
-        score = 0.0
-
-        # --- 1. Point margin (most important) ---
-        margin = pp - op
-        score += margin
-
-        # --- 2. Available carpet + mobility from current moves ---
-        moves = b.get_valid_moves()
-        best_carpet = 0.0
-        carpet_sum = 0.0
-        n_prime = 0
-        n_plain = 0
-        n_carpet = 0
-
-        for m in moves:
-            if m.move_type == enums.MoveType.CARPET:
-                pts = self._cpt[m.roll_length]
-                if pts > best_carpet:
-                    best_carpet = pts
-                if pts > 0:
-                    carpet_sum += pts
-                    n_carpet += 1
-            elif m.move_type == enums.MoveType.PRIME:
-                n_prime += 1
-            elif m.move_type == enums.MoveType.PLAIN:
-                n_plain += 1
-
-        score += best_carpet * 0.60
-        score += carpet_sum * 0.10
-        score += n_carpet * 0.15
-        score += n_prime * 0.10
-        score += n_plain * 0.10
-
-        # Midgame as Player A: push harder on converting initiative into
-        # immediate board value instead of more setup/search.
-        if MIDGAME_TURNS_LOW <= turns <= MIDGAME_TURNS_HIGH:
-            u = (MIDGAME_TURNS_HIGH - turns + 1) / (MIDGAME_TURNS_HIGH - MIDGAME_TURNS_LOW + 1)
-            score += best_carpet * 0.30 * u
-            score += carpet_sum * 0.14 * u
-            score += n_plain * 0.20 * u
-            score -= n_prime * 0.15 * u
-
-        # If a meaningful carpet is already available, bias toward converting
-        # it now instead of continuing to over-prime or over-search.
-        if best_carpet >= 4:
-            score += 0.8
-        if margin > 0 and best_carpet >= 4:
-            score += 0.8
-        if margin > 0 and best_carpet >= 6:
-            score += 1.2
-
-        # Once there is real scoring on the table, make additional priming
-        # much less attractive.
-        prime_penalty = 0.0
-        if best_carpet >= 2:
-            prime_penalty += 0.12
-        if best_carpet >= 4:
-            prime_penalty += 0.18
-        if carpet_sum >= 6:
-            prime_penalty += 0.12
-        if margin > 0 and best_carpet >= 4:
-            prime_penalty += 0.10
-        if prime_penalty > 0:
-            score -= n_prime * prime_penalty
-
-        # --- 3. Cell potential (Carrie-style spatial heuristic) ---
-        # The precomputed potential map is from the root board state, so it's
-        # slightly stale at deeper leaves. But the board changes only a few
-        # cells per ply, so it's a good approximation. We use it as a light
-        # directional signal, not a dominant term.
-        if self._cell_pot is not None:
-            px, py = ploc
-            SZ = self.SZ
-            # Player's local potential (within Manhattan distance 4)
-            my_pot = 0.0
-            for dy in range(-4, 5):
-                ny = py + dy
-                if ny < 0 or ny >= SZ:
+        
+        my_loc = b.player_worker.get_location()
+        opp_loc = b.opponent_worker.get_location()
+        
+        my_pot = 0.0
+        opp_pot = 0.0
+        
+        for y in range(self.SZ):
+            for x in range(self.SZ):
+                cell = b.get_cell((x, y))
+                if cell not in (enums.Cell.SPACE, enums.Cell.PRIMED):
                     continue
-                ady = abs(dy)
-                for dx in range(-(4 - ady), 5 - ady):
-                    nx = px + dx
-                    if nx < 0 or nx >= SZ:
-                        continue
-                    my_pot += self._cell_pot[ny, nx]
-            score += my_pot * 0.05
-
-        # --- 4. Opponent direct carpet threat ---
-        # Compute from the ACTUAL leaf board, not the stale cache.
-        opp_threat = self._opp_threat_live(b, oloc)
-        score -= opp_threat * 0.22
-
-        # --- 5. Endgame amplification ---
-        if turns <= 10:
-            u = (11 - turns) / 10.0
-            score += margin * 0.2 * u
-            score += best_carpet * 0.35 * u
-
-        # --- 6. Rat search opportunity ---
-        rp = float(np.max(self.belief))
-        rev = RAT_FIND_PTS * rp + RAT_MISS_PTS * (1.0 - rp)
-        if rev > 0:
-            score += rev * 0.12
-
-        return score
+                
+                h = 1 + rL[y][x] + rR[y][x]
+                v = 1 + rU[y][x] + rD[y][x]
+                pot = max(self._cpt.get(min(h,7), 0),
+                        self._cpt.get(min(v,7), 0), 0)
+                if pot <= 0:
+                    pot = 0.5
+                
+                my_d = abs(my_loc[0] - x) + abs(my_loc[1] - y)
+                opp_d = abs(opp_loc[0] - x) + abs(opp_loc[1] - y)
+                
+                # StockChicken's key insight: turns/distance weighting
+                if my_d <= turns:
+                    my_pot += pot * turns / max(1, my_d)
+                if opp_d <= turns:
+                    opp_pot += pot * turns / max(1, opp_d)
+        
+        return (my_score - opp_score) * turns + my_pot - opp_pot
 
     # Check how long of a carpet roll the opponent could do right now from their position.
     def _opp_threat_live(self, b: board.Board, oloc: Tuple[int, int]) -> float:

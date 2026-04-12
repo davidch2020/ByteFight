@@ -1,520 +1,549 @@
 from collections.abc import Callable
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import random
-import time
+import time as time_module
+
 import numpy as np
 
 from game import board, move, enums, rat
 from game.move import Move
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — localized to avoid module attribute lookups in hot paths
 # ---------------------------------------------------------------------------
+SEARCH_PROB_THRESHOLD = 0.50
 RAT_FIND_PTS = 4
-RAT_MISS_PTS = -2
-SEARCH_PROB_FLOOR = 0.55
-SEARCH_EV_FLOOR = 0.5
+RAT_MISS_PTS = 2
 
-TIME_HARD_FLOOR = 1.0
-MAX_DEPTH = 9
-MIN_DEPTH = 3
+# Time: exponential decay scaled from StockChicken.
+# Sum of 17.5 * 0.93^(t-1) for t=1..40 ≈ 236s, leaving ~4s safety margin.
+# Zero turns get clamped — every turn uses its full budget.
+# Turn 1: 17.5s, Turn 10: 9.1s, Turn 20: 4.4s, Turn 40: 1.0s
+TIME_BASE = 17.5
+TIME_DECAY = 0.93
+TIME_FLOOR = 1.5          # Never let total remaining drop below this
+
+MAX_DEPTH = 40             # Iterative deepening stops on time, not this
+
+# Carpet points as a list for O(1) index lookup (index 0 unused)
+_CPT = [0, -1, 2, 4, 6, 10, 15, 21]  # index = roll_length
+
+# Inline constants to avoid module lookups in tight loops
+_CARPET_MT = int(enums.MoveType.CARPET)
+_PRIME_MT = int(enums.MoveType.PRIME)
+_PLAIN_MT = int(enums.MoveType.PLAIN)
+
+# Noise probs as a flat lookup: _NOISE_LUT[(cell_type, noise_type)] = prob
+_NOISE_LUT = {}
+for _ct, _probs in rat.NOISE_PROBS.items():
+    for _nt in range(3):
+        _NOISE_LUT[(int(_ct), _nt)] = _probs[_nt]
+
+_DIST_ERR = rat.DISTANCE_ERROR_PROBS  # (0.12, 0.7, 0.12, 0.06)
 
 
+# ---------------------------------------------------------------------------
+# Transposition Table
+# ---------------------------------------------------------------------------
+class TT:
+    __slots__ = ('table', 'hits', 'misses')
+
+    def __init__(self):
+        self.table = {}
+        self.hits = 0
+        self.misses = 0
+
+    def lookup(self, key, depth, alpha, beta):
+        """Returns (value, best_move_key, found)."""
+        entry = self.table.get(key)
+        if entry is None:
+            self.misses += 1
+            return 0.0, None, False
+
+        sd, sv, sm, nt = entry
+        if sd < depth:
+            self.misses += 1
+            return 0.0, sm, False  # Move hint even on depth miss
+
+        if nt == 0:  # EXACT
+            self.hits += 1
+            return sv, sm, True
+        elif nt == 1 and sv >= beta:  # LOWER
+            self.hits += 1
+            return sv, sm, True
+        elif nt == 2 and sv <= alpha:  # UPPER
+            self.hits += 1
+            return sv, sm, True
+
+        self.misses += 1
+        return 0.0, sm, False
+
+    def store(self, key, depth, value, best_move_key, orig_alpha, beta):
+        if value <= orig_alpha:
+            nt = 2   # UPPER
+        elif value >= beta:
+            nt = 1   # LOWER
+        else:
+            nt = 0   # EXACT
+
+        old = self.table.get(key)
+        if old is None or depth >= old[0]:
+            self.table[key] = (depth, value, best_move_key, nt)
+
+    def maybe_clear(self, max_size=500000):
+        """If table is too large, wipe it. O(1) via GC, much faster than partial eviction."""
+        if len(self.table) > max_size:
+            self.table = {}
+
+
+# ---------------------------------------------------------------------------
+# Fast helpers (module-level to avoid method lookup overhead)
+# ---------------------------------------------------------------------------
+def _best_carpet_run(primed_mask, px, py, ox, oy):
+    """Best carpet points available from (px,py), blocked by (ox,oy).
+    Pure bitboard — zero get_cell() calls."""
+    best = 0
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        nx, ny = px + dx, py + dy
+        run = 0
+        while 0 <= nx < 8 and 0 <= ny < 8:
+            if nx == ox and ny == oy:
+                break
+            if not ((primed_mask >> (ny * 8 + nx)) & 1):
+                break
+            run += 1
+            nx += dx
+            ny += dy
+        if run >= 1:
+            pts = _CPT[min(run, 7)]
+            if pts > best:
+                best = pts
+    return best
+
+
+def _eval_board(b):
+    """Ultra-lean heuristic. No get_cell(). No get_valid_moves().
+    ~30 bit ops + 2 direction scans (max 8 steps each)."""
+    pw = b.player_worker
+    ow = b.opponent_worker
+    pp = pw.points
+    op_ = ow.points
+    px, py = pw.position
+    ox, oy = ow.position
+    turns = pw.turns_left if pw.turns_left > 0 else 1
+    primed_mask = b._primed_mask
+
+    # 1. Score margin, weighted by remaining game length
+    margin = pp - op_
+    score = margin * (1.0 + turns * 0.12)
+
+    # 2. Best carpet available to player RIGHT NOW
+    score += _best_carpet_run(primed_mask, px, py, ox, oy) * 0.5
+
+    # 3. Best carpet available to opponent (threat)
+    score -= _best_carpet_run(primed_mask, ox, oy, px, py) * 0.3
+
+    # 4. Primed cell count — proxy for future carpet infrastructure
+    score += bin(primed_mask).count('1') * 0.12
+
+    # 5. Can we prime from current position? (must be on SPACE)
+    my_bit = 1 << (py * 8 + px)
+    if not ((primed_mask | b._carpet_mask) & my_bit):
+        score += 0.4
+
+    # 6. Adjacent primed cells (potential carpet starts — 4 checks)
+    adj = 0
+    if px > 0 and (primed_mask >> (py * 8 + px - 1)) & 1: adj += 1
+    if px < 7 and (primed_mask >> (py * 8 + px + 1)) & 1: adj += 1
+    if py > 0 and (primed_mask >> ((py - 1) * 8 + px)) & 1: adj += 1
+    if py < 7 and (primed_mask >> ((py + 1) * 8 + px)) & 1: adj += 1
+    score += adj * 0.2
+
+    return score
+
+
+def _order_moves(moves, tt_hint, killers):
+    """Bucket-sort moves. ~3x faster than sorted() with a closure in Python.
+    TT hint → killers → carpets (by length desc) → primes → plains."""
+    front = []
+    carpets = []
+    primes = []
+    plains = []
+
+    for m in moves:
+        mt = m.move_type
+        # Check if this matches the TT hint
+        if tt_hint is not None and mt == tt_hint[0] and m.direction == tt_hint[2]:
+            if mt != _CARPET_MT or m.roll_length == tt_hint[1]:
+                front.insert(0, m)
+                continue
+
+        if mt == _CARPET_MT:
+            carpets.append(m)
+        elif mt == _PRIME_MT:
+            primes.append(m)
+        else:
+            plains.append(m)
+
+    # Sort carpets by roll_length descending (longer = more points)
+    if len(carpets) > 1:
+        carpets.sort(key=lambda m: m.roll_length, reverse=True)
+
+    # Pull killer matches to front
+    if killers:
+        rest_c = []
+        rest_p = []
+        rest_pl = []
+        for m in carpets:
+            if _match_killer(m, killers):
+                front.append(m)
+            else:
+                rest_c.append(m)
+        for m in primes:
+            if _match_killer(m, killers):
+                front.append(m)
+            else:
+                rest_p.append(m)
+        for m in plains:
+            if _match_killer(m, killers):
+                front.append(m)
+            else:
+                rest_pl.append(m)
+        return front + rest_c + rest_p + rest_pl
+
+    return front + carpets + primes + plains
+
+
+def _match_killer(m, killers):
+    """Check if move matches any killer. Killers are (mt, roll, dir) tuples."""
+    mt = m.move_type
+    d = m.direction
+    for kt, kr, kd in killers:
+        if mt == kt and d == kd:
+            if mt != _CARPET_MT or m.roll_length == kr:
+                return True
+    return False
+
+
+def _move_key(m):
+    """Compact tuple for TT/killer storage. No Move object references held."""
+    return (m.move_type,
+            m.roll_length if m.move_type == _CARPET_MT else 0,
+            m.direction)
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
 class PlayerAgent:
     """
-    Expectiminimax agent targeting Carrie-level play.
-
-    Architecture
-    ------------
-    1.  HMM belief tracking for the rat (predict + sensor update each turn).
-    2.  Per-turn precomputation of a *cell potential map*: for every cell on
-        the board, estimate how many carpet points it contributes to (if
-        already primed) or could contribute to (if primed in the future),
-        discounted by distance from the player.  This is what Carrie's
-        "potential of each cell and its distance from the bot" refers to.
-    3.  Iterative-deepening expectiminimax with alpha-beta pruning.
-        - At max nodes the best rat-search move is a candidate alongside
-          movement moves, evaluated as a flat EV from the current belief.
-        - The heuristic uses the precomputed potential map for O(local)
-          evaluation instead of scanning the whole board at every leaf.
-    4.  Move ordering: carpet (by points) > prime > plain.
+    V8: Speed-first minimax with TT, killers, lean eval.
+    Designed to use the full 240s budget and search as deep as possible.
     """
 
-    # Set up rat belief distribution and precompute the spawn prior after 1000 random steps.
     def __init__(self, board_obj, transition_matrix=None, time_left: Callable = None):
         self.T = np.array(transition_matrix, dtype=np.float64)
-        self.SZ = enums.BOARD_SIZE  # 8
-
-        # Rat spawn prior: placed at (0,0), 1000 free steps.
         self.initial_belief = np.zeros(64, dtype=np.float64)
         self.initial_belief[0] = 1.0
         for _ in range(1000):
             self.initial_belief = self.initial_belief @ self.T
         self.belief = self.initial_belief.copy()
 
-        # Fast carpet-points lookup
-        self._cpt = enums.CARPET_POINTS_TABLE
+        self.tt = TT()
+        self.killer_moves = {}   # depth -> [(mt, roll, dir), ...]
+        self.turn_number = 0
 
-        # Per-turn caches (set in _precompute)
-        self._cell_pot = None        # (SZ, SZ) float — cell potential map
-        self._is_primed = None       # (SZ, SZ) bool grid
-        self._grid = None            # (SZ, SZ) CellType grid
-
-        self.nodes_visited = 0
-
-    # ------------------------------------------------------------------
-    # Geometry
-    # ------------------------------------------------------------------
-    # Convert (x, y) board position to flat index (0-63).
-    def _idx(self, loc):
-        return loc[1] * self.SZ + loc[0]
-
-    # Convert flat index (0-63) back to (x, y) board position.
-    def _loc(self, idx):
-        return (idx % self.SZ, idx // self.SZ)
-
-    # Normalize belief array so probabilities sum to 1. Falls back to spawn prior if all zeros.
-    def _normalize(self, b):
-        s = b.sum()
-        return b / s if s > 0 else self.initial_belief.copy()
-
-    # ------------------------------------------------------------------
-    # Entry points
-    # ------------------------------------------------------------------
-    # Optional end-of-game commentary (unused).
     def commentate(self):
-        return ""
+        t = self.tt
+        total = t.hits + t.misses
+        r = t.hits / total if total > 0 else 0
+        return f"TT: {t.hits}/{total} ({r:.0%}), size={len(t.table)}"
 
-    # Main entry point each turn: update rat belief, precompute board data, then run search to pick a move.
+    # ------------------------------------------------------------------
+    # Entry
+    # ------------------------------------------------------------------
     def play(self, b: board.Board, sensor_data: Tuple, time_left: Callable):
-        self.nodes_visited = 0
-        t0 = time.time()
+        self.turn_number += 1
+        self.killer_moves.clear()
+        self.tt.maybe_clear()
 
-        # 1. Belief update
+        # 1. Rat belief
         self._update_belief(b, sensor_data)
 
-        # 2. Precompute spatial data for this turn
-        self._precompute(b)
+        # 2. Rat search candidate
+        search_move = self._choose_search(b)
 
-        # 3. Iterative deepening search
-        best = self._id_search(b, time_left, t0)
+        # 3. Time budget for this turn
+        budget = TIME_BASE * (TIME_DECAY ** (self.turn_number - 1))
+        remaining = time_left() - TIME_FLOOR
+        alloc = max(0.05, min(budget, remaining))
+        deadline = time_module.time() + alloc
+
+        # 4. Search
+        best = self._id_search(b, search_move, deadline, time_left)
         if best is not None:
             return best
-
-        return random.choice(b.get_valid_moves())
+        moves = b.get_valid_moves()
+        return random.choice(moves) if moves else Move.plain(enums.Direction.UP)
 
     # ------------------------------------------------------------------
-    # HMM belief
+    # Iterative deepening
     # ------------------------------------------------------------------
-    # Update rat probability distribution: reset on captures, zero out failed searches, apply transition matrix, then incorporate sensor data.
-    def _update_belief(self, b: board.Board, sd: Tuple):
+    def _id_search(self, b, search_move, deadline, time_left):
+        cands = b.get_valid_moves()
+        if not cands:
+            return None
+        if len(cands) == 1 and search_move is None:
+            return cands[0]
+
+        best_move = cands[0]
+        _now = time_module.time  # Cache function reference
+
+        for depth in range(1, MAX_DEPTH + 1):
+            if _now() >= deadline:
+                break
+
+            mv, sc = self._root(b, cands, search_move, depth, deadline)
+            if mv is not None:
+                best_move = mv
+            else:
+                break  # Timed out mid-search
+
+            # Safety: don't start next depth if globally low
+            if time_left() < TIME_FLOOR + 0.3:
+                break
+
+        return best_move
+
+    # ------------------------------------------------------------------
+    # Root
+    # ------------------------------------------------------------------
+    def _root(self, b, cands, search_move, depth, deadline):
+        _now = time_module.time
+        rk = self._board_key(b, True)
+        _, tt_hint, _ = self.tt.lookup(rk, depth, -999999.0, 999999.0)
+        killers = self.killer_moves.get(depth, [])
+        ordered = _order_moves(cands, tt_hint, killers)
+
+        best_move = None
+        best_sc = -999999.0
+        alpha = -999999.0
+        beta = 999999.0
+
+        # Rat search as candidate
+        if search_move is not None:
+            bidx = int(np.argmax(self.belief))
+            p = float(self.belief[bidx])
+            sev = RAT_FIND_PTS * p - RAT_MISS_PTS * (1.0 - p)
+            if sev > 0:
+                best_sc = sev
+                best_move = search_move
+                alpha = sev
+
+        for m in ordered:
+            if _now() >= deadline:
+                return None, None
+            nb = b.forecast_move(m)
+            if nb is None:
+                continue
+            nb.reverse_perspective()
+            sc = self._ab(nb, alpha, beta, depth - 1, False, deadline)
+            if sc is None:
+                return None, None
+            if sc > best_sc:
+                best_sc = sc
+                best_move = m
+            if best_sc > alpha:
+                alpha = best_sc
+
+        return best_move, best_sc
+
+    # ------------------------------------------------------------------
+    # Alpha-Beta
+    # ------------------------------------------------------------------
+    def _ab(self, b, alpha, beta, depth, maximizing, deadline):
+        if time_module.time() >= deadline:
+            return None
+
+        # Leaf
+        if depth <= 0 or b.winner is not None:
+            if not maximizing:
+                b.reverse_perspective()
+            return _eval_board(b)
+
+        # TT probe
+        key = self._board_key(b, maximizing)
+        tt_val, tt_hint, tt_found = self.tt.lookup(key, depth, alpha, beta)
+        if tt_found:
+            return tt_val
+
+        moves = b.get_valid_moves()
+        if not moves:
+            if not maximizing:
+                b.reverse_perspective()
+            return _eval_board(b)
+
+        killers = self.killer_moves.get(depth, [])
+        ordered = _order_moves(moves, tt_hint, killers)
+        orig_alpha = alpha
+        best_mk = None
+        _now = time_module.time
+
+        if maximizing:
+            best = -999999.0
+            for m in ordered:
+                if _now() >= deadline:
+                    return None
+                nb = b.forecast_move(m)
+                if nb is None:
+                    continue
+                nb.reverse_perspective()
+                val = self._ab(nb, alpha, beta, depth - 1, False, deadline)
+                if val is None:
+                    return None
+                if val > best:
+                    best = val
+                    best_mk = _move_key(m)
+                if best > alpha:
+                    alpha = best
+                if alpha >= beta:
+                    self._add_killer(depth, m)
+                    break
+        else:
+            best = 999999.0
+            for m in ordered:
+                if _now() >= deadline:
+                    return None
+                nb = b.forecast_move(m)
+                if nb is None:
+                    continue
+                nb.reverse_perspective()
+                val = self._ab(nb, alpha, beta, depth - 1, True, deadline)
+                if val is None:
+                    return None
+                if val < best:
+                    best = val
+                    best_mk = _move_key(m)
+                if best < beta:
+                    beta = best
+                if alpha >= beta:
+                    self._add_killer(depth, m)
+                    break
+
+        self.tt.store(key, depth, best, best_mk, orig_alpha, beta)
+        return best
+
+    # ------------------------------------------------------------------
+    # Board key for TT
+    # ------------------------------------------------------------------
+    def _board_key(self, b, maximizing):
+        return (
+            b._primed_mask,
+            b._carpet_mask,
+            b.player_worker.position,
+            b.opponent_worker.position,
+            b.player_worker.points,
+            b.opponent_worker.points,
+            b.player_worker.turns_left,
+            maximizing,
+        )
+
+    # ------------------------------------------------------------------
+    # Killer moves — lightweight tuples
+    # ------------------------------------------------------------------
+    def _add_killer(self, depth, m):
+        mk = _move_key(m)
+        ks = self.killer_moves.get(depth)
+        if ks is None:
+            self.killer_moves[depth] = [mk]
+            return
+        if mk not in ks:
+            if len(ks) >= 2:
+                ks[1] = ks[0]
+                ks[0] = mk
+            else:
+                ks.insert(0, mk)
+
+    # ------------------------------------------------------------------
+    # Rat HMM (V5 logic, optimized access)
+    # ------------------------------------------------------------------
+    def _update_belief(self, b, sd):
         ol, of_ = b.opponent_search
         pl, pf = b.player_search
 
         if pf:
             self.belief = self.initial_belief.copy()
         elif pl is not None:
-            self.belief[self._idx(pl)] = 0.0
-            self.belief = self._normalize(self.belief)
+            self.belief[pl[1] * 8 + pl[0]] = 0.0
+            self._norm()
 
         if of_:
             self.belief = self.initial_belief.copy()
         elif ol is not None:
-            self.belief[self._idx(ol)] = 0.0
-            self.belief = self._normalize(self.belief)
+            self.belief[ol[1] * 8 + ol[0]] = 0.0
+            self._norm()
 
         # Predict
         self.belief = self.belief @ self.T
 
-        # Sensor update
-        wx, wy = b.player_worker.get_location()
+        # Sensor update — inline bitboard, no get_cell()
+        wx, wy = b.player_worker.position
+        noise = sd[0]
+        rdist = sd[1]
+        pm = b._primed_mask
+        cm = b._carpet_mask
+        bm = b._blocked_mask
+
+        belief = self.belief  # Local ref for speed
         for i in range(64):
-            cx, cy = i % self.SZ, i // self.SZ
-            cell = b.get_cell((cx, cy))
-            np_ = rat.NOISE_PROBS[cell][sd[0]]
+            cx = i & 7       # i % 8
+            cy = i >> 3      # i // 8
+            bit = 1 << i
+
+            # Cell type via bitboard
+            if pm & bit:
+                ct = 1
+            elif cm & bit:
+                ct = 2
+            elif bm & bit:
+                ct = 3
+            else:
+                ct = 0
+
+            np_ = _NOISE_LUT[(ct, noise)]
             md = abs(wx - cx) + abs(wy - cy)
-            diff = sd[1] - md
-            dp = rat.DISTANCE_ERROR_PROBS[diff + 1] if -1 <= diff <= 2 else 0.0
-            self.belief[i] *= np_ * dp
+            diff = rdist - md
+            if -1 <= diff <= 2:
+                dp = _DIST_ERR[diff + 1]
+            else:
+                dp = 0.0
 
-        self.belief = self._normalize(self.belief)
+            belief[i] *= np_ * dp
 
-    # ------------------------------------------------------------------
-    # Precompute spatial data (once per turn, before search)
-    # ------------------------------------------------------------------
-    # Build a cell potential map scoring each cell by how many carpet points it could yield, discounted by distance from our worker.
-    def _precompute(self, b: board.Board):
-        """
-        Build the cell potential map — Carrie's core advantage.
+        self._norm()
 
-        For each cell we compute how many carpet points it participates in
-        (or would participate in if primed), considering contiguous primed
-        neighbours in all four cardinal directions.
-
-        The potential is discounted by Manhattan distance from our worker,
-        so nearby cells are more valuable.
-        """
-        SZ = self.SZ
-        pp = b.player_worker.get_location()
-        px, py = pp
-
-        # Snapshot the board into fast-access arrays
-        is_p = [[False]*SZ for _ in range(SZ)]
-        for y in range(SZ):
-            for x in range(SZ):
-                if b.get_cell((x, y)) == enums.Cell.PRIMED:
-                    is_p[y][x] = True
-        self._is_primed = is_p
-
-        # Precompute run lengths in each direction.
-        # run_L[y][x] = # of contiguous primed cells to the left of (x,y),
-        #               NOT including (x,y) itself.
-        rL = [[0]*SZ for _ in range(SZ)]
-        rR = [[0]*SZ for _ in range(SZ)]
-        rU = [[0]*SZ for _ in range(SZ)]
-        rD = [[0]*SZ for _ in range(SZ)]
-
-        for y in range(SZ):
-            for x in range(1, SZ):
-                if is_p[y][x-1]:
-                    rL[y][x] = rL[y][x-1] + 1
-            for x in range(SZ-2, -1, -1):
-                if is_p[y][x+1]:
-                    rR[y][x] = rR[y][x+1] + 1
-        for x in range(SZ):
-            for y in range(1, SZ):
-                if is_p[y-1][x]:
-                    rU[y][x] = rU[y-1][x] + 1
-            for y in range(SZ-2, -1, -1):
-                if is_p[y+1][x]:
-                    rD[y][x] = rD[y+1][x] + 1
-
-        # Build potential map
-        pot = np.zeros((SZ, SZ), dtype=np.float64)
-        cpt = self._cpt
-
-        for y in range(SZ):
-            for x in range(SZ):
-                ct = b.get_cell((x, y))
-                d = abs(px - x) + abs(py - y)
-                discount = 1.0 / (1.0 + 0.3 * d)
-
-                if ct == enums.Cell.PRIMED:
-                    # Best run through this cell
-                    h = 1 + rL[y][x] + rR[y][x]
-                    v = 1 + rU[y][x] + rD[y][x]
-                    best = min(max(h, v), 7)
-                    pts = cpt[best] if best >= 2 else 0
-                    pot[y, x] = max(pts, 0) * discount
-
-                elif ct == enums.Cell.SPACE:
-                    # Hypothetical: if we primed this cell, what run would it join?
-                    h = 1 + rL[y][x] + rR[y][x]
-                    v = 1 + rU[y][x] + rD[y][x]
-                    hp = cpt[min(h, 7)] if h >= 2 else 0
-                    vp = cpt[min(v, 7)] if v >= 2 else 0
-                    best_p = max(hp, vp, 0)
-                    # Even isolated cells have small future value
-                    if best_p == 0:
-                        best_p = 0.25
-                    pot[y, x] = best_p * discount
-
-                # CARPET and BLOCKED → 0
-
-        self._cell_pot = pot
-        self._rL = rL
-        self._rR = rR
-        self._rU = rU
-        self._rD = rD
-
-    # ------------------------------------------------------------------
-    # Iterative deepening
-    # ------------------------------------------------------------------
-    # Iterative deepening: run expectiminimax at increasing depths until time runs low, keeping the best move found so far.
-    def _id_search(self, b, time_left, t0):
-        best_move = None
-        cands = b.get_valid_moves()
-        if not cands:
-            return None
-        if len(cands) == 1:
-            return cands[0]
-
-        root_pts = b.player_worker.get_points()
-
-        for depth in range(MIN_DEPTH, MAX_DEPTH + 1):
-            if time_left() < TIME_HARD_FLOOR + 1.5:
-                break
-
-            it0 = time.time()
-            mv, sc = self._root(b, cands, root_pts, depth, time_left)
-            it_dur = time.time() - it0
-
-            if mv is not None:
-                best_move = mv
-
-            rem = time_left()
-            turns = max(b.player_worker.turns_left, 1)
-            budget = self._frontloaded_turn_budget(rem, turns)
-
-            if rem < TIME_HARD_FLOOR + it_dur * 6:
-                break
-            if (time.time() - t0) > budget * 1.5 and depth >= MIN_DEPTH:
-                break
-
-        return best_move
-
-    # Give earlier turns a larger share of the remaining time. Early turns
-    # usually have the highest strategic leverage because they shape more of
-    # the board and future carpet lanes than late cleanup turns do.
-    def _frontloaded_turn_budget(self, rem: float, turns_left: int) -> float:
-        usable = max(rem - TIME_HARD_FLOOR, 0.0)
-        base_budget = usable / max(turns_left, 1)
-
-        turn_ratio = turns_left / enums.MAX_TURNS_PER_PLAYER
-        frontload_factor = 0.5 + turn_ratio
-
-        return base_budget * frontload_factor
-
-    # ------------------------------------------------------------------
-    # Root search
-    # ------------------------------------------------------------------
-    # Evaluate all candidate moves (including rat search) at the root and return the best move + score.
-    def _root(self, b, cands, root_pts, depth, time_left):
-        ordered = self._order(cands)
-        best_move = None
-        best_sc = float('-inf')
-        alpha = float('-inf')
-        beta = float('inf')
-
-        # Rat search candidate
-        sm, sev = self._rat_search_ev()
-        if sm is not None and sev > best_sc:
-            best_sc = sev
-            best_move = sm
-            alpha = max(alpha, best_sc)
-
-        for m in ordered:
-            if time_left() < TIME_HARD_FLOOR:
-                break
-            nb = b.forecast_move(m)
-            if nb is None:
-                continue
-            nb.reverse_perspective()
-            sc = self._emm(nb, alpha, beta, root_pts, depth - 1, False, time_left)
-            if sc > best_sc:
-                best_sc = sc
-                best_move = m
-            alpha = max(alpha, best_sc)
-
-        return best_move, best_sc
-
-    # Compute expected value of searching for the rat at its most likely cell. Return the move + EV if worth it.
-    def _rat_search_ev(self):
-        idx = int(np.argmax(self.belief))
-        p = self.belief[idx]
-        ev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-        if p >= SEARCH_PROB_FLOOR and ev >= SEARCH_EV_FLOOR:
-            return Move.search(self._loc(idx)), ev
-        return None, float('-inf')
-
-    # ------------------------------------------------------------------
-    # Expectiminimax
-    # ------------------------------------------------------------------
-    # Recursive expectiminimax with alpha-beta pruning. Max nodes pick best move, min nodes assume opponent plays optimally.
-    def _emm(self, b, alpha, beta, root_pts, depth, maximizing, time_left):
-        self.nodes_visited += 1
-
-        if depth <= 0 or time_left() < TIME_HARD_FLOOR:
-            if not maximizing:
-                b.reverse_perspective()
-            return self._eval(b, root_pts)
-
-        moves = b.get_valid_moves()
-        if not moves:
-            if not maximizing:
-                b.reverse_perspective()
-            return self._eval(b, root_pts)
-
-        ordered = self._order(moves)
-
-        if maximizing:
-            best = float('-inf')
-
-            # Rat-search chance node at max nodes
-            idx = int(np.argmax(self.belief))
-            p = self.belief[idx]
-            sev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-            if p >= SEARCH_PROB_FLOOR and sev >= SEARCH_EV_FLOOR:
-                # Search doesn't change the board. The value is:
-                # the expected points from the search (sev) plus
-                # the continuation value where the opponent plays next
-                # on the unchanged board.
-                # To avoid the cost of a recursive call for the search
-                # branch (which would be on the same board), we use the
-                # raw sev as the search value. This is a sound approximation
-                # because the board state is unchanged — only the score shifts.
-                best = max(best, sev)
-                if best >= beta:
-                    return best
-                alpha = max(alpha, best)
-
-            for m in ordered:
-                if time_left() < TIME_HARD_FLOOR:
-                    break
-                nb = b.forecast_move(m)
-                if nb is None:
-                    continue
-                nb.reverse_perspective()
-                val = self._emm(nb, alpha, beta, root_pts, depth - 1, False, time_left)
-                best = max(best, val)
-                if best >= beta:
-                    return best
-                alpha = max(alpha, best)
-            return best
+    def _norm(self):
+        s = self.belief.sum()
+        if s > 0:
+            self.belief /= s
         else:
-            best = float('inf')
-            for m in ordered:
-                if time_left() < TIME_HARD_FLOOR:
-                    break
-                nb = b.forecast_move(m)
-                if nb is None:
-                    continue
-                nb.reverse_perspective()
-                val = self._emm(nb, alpha, beta, root_pts, depth - 1, True, time_left)
-                best = min(best, val)
-                if best <= alpha:
-                    return best
-                beta = min(beta, best)
-            return best
+            self.belief = self.initial_belief.copy()
 
-    # ------------------------------------------------------------------
-    # Move ordering
-    # ------------------------------------------------------------------
-    # Sort moves so carpet rolls come first, then primes, then plains -- helps alpha-beta prune faster.
-    def _order(self, moves):
-        def key(m):
-            if m.move_type == enums.MoveType.CARPET:
-                return (3, self._cpt.get(m.roll_length, 21))
-            if m.move_type == enums.MoveType.PRIME:
-                # Use precomputed cell potential to order primes.
-                # A prime move departs from the current cell (priming it)
-                # and lands on the destination. We want to prime cells
-                # that extend long runs, so score by the destination's
-                # potential — but the primed cell is actually the ORIGIN,
-                # not the destination. Since we don't have origin info on
-                # the Move object, use a flat priority. The tree will sort
-                # out the best prime.
-                return (2, 0)
-            if m.move_type == enums.MoveType.PLAIN:
-                return (1, 0)
-            return (0, 0)
-        return sorted(moves, key=key, reverse=True)
+    def _choose_search(self, b):
+        bidx = int(np.argmax(self.belief))
+        p = float(self.belief[bidx])
+        if p < SEARCH_PROB_THRESHOLD:
+            return None
 
-    # ------------------------------------------------------------------
-    # Heuristic evaluation
-    # ------------------------------------------------------------------
-    # Score a board state: point margin + available carpet value + nearby cell potential + opponent threat - endgame adjustments.
-    def _eval(self, b: board.Board, root_pts: int) -> float:
-        pp = b.player_worker.get_points()
-        op = b.opponent_worker.get_points()
-        ploc = b.player_worker.get_location()
-        oloc = b.opponent_worker.get_location()
-        turns = b.player_worker.turns_left
+        ev = RAT_FIND_PTS * p - RAT_MISS_PTS * (1.0 - p)
 
-        score = 0.0
+        # Opportunity cost check
+        px, py = b.player_worker.position
+        ox, oy = b.opponent_worker.position
+        bc = _best_carpet_run(b._primed_mask, px, py, ox, oy)
+        if bc > ev + 1:
+            return None
 
-        # --- 1. Point margin (most important) ---
-        margin = pp - op
-        score += margin
-
-        # --- 2. Available carpet + mobility from current moves ---
-        moves = b.get_valid_moves()
-        best_carpet = 0.0
-        carpet_sum = 0.0
-        n_prime = 0
-        n_plain = 0
-        n_carpet = 0
-
-        for m in moves:
-            if m.move_type == enums.MoveType.CARPET:
-                pts = self._cpt[m.roll_length]
-                if pts > best_carpet:
-                    best_carpet = pts
-                if pts > 0:
-                    carpet_sum += pts
-                    n_carpet += 1
-            elif m.move_type == enums.MoveType.PRIME:
-                n_prime += 1
-            elif m.move_type == enums.MoveType.PLAIN:
-                n_plain += 1
-
-        score += best_carpet * 0.45
-        score += carpet_sum * 0.06
-        score += n_carpet * 0.10
-        score += n_prime * 0.25
-        score += n_plain * 0.04
-
-        # --- 3. Cell potential (Carrie-style spatial heuristic) ---
-        # The precomputed potential map is from the root board state, so it's
-        # slightly stale at deeper leaves. But the board changes only a few
-        # cells per ply, so it's a good approximation. We use it as a light
-        # directional signal, not a dominant term.
-        if self._cell_pot is not None:
-            px, py = ploc
-            SZ = self.SZ
-            # Player's local potential (within Manhattan distance 4)
-            my_pot = 0.0
-            for dy in range(-4, 5):
-                ny = py + dy
-                if ny < 0 or ny >= SZ:
-                    continue
-                ady = abs(dy)
-                for dx in range(-(4 - ady), 5 - ady):
-                    nx = px + dx
-                    if nx < 0 or nx >= SZ:
-                        continue
-                    my_pot += self._cell_pot[ny, nx]
-            score += my_pot * 0.05
-
-        # --- 4. Opponent direct carpet threat ---
-        # Compute from the ACTUAL leaf board, not the stale cache.
-        opp_threat = self._opp_threat_live(b, oloc)
-        score -= opp_threat * 0.22
-
-        # --- 5. Endgame amplification ---
-        if turns <= 10:
-            u = (11 - turns) / 10.0
-            score += margin * 0.2 * u
-            score += best_carpet * 0.35 * u
-
-        # --- 6. Rat search opportunity ---
-        rp = float(np.max(self.belief))
-        rev = RAT_FIND_PTS * rp + RAT_MISS_PTS * (1.0 - rp)
-        if rev > 0:
-            score += rev * 0.12
-
-        return score
-
-    # Check how long of a carpet roll the opponent could do right now from their position.
-    def _opp_threat_live(self, b: board.Board, oloc: Tuple[int, int]) -> float:
-        """
-        Max carpet run the opponent could roll right now.
-        Reads directly from the board (not stale cache) for accuracy.
-        """
-        ox, oy = oloc
-        best = 0.0
-        SZ = self.SZ
-        cpt = self._cpt
-        PRIMED = enums.Cell.PRIMED
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nx, ny = ox + dx, oy + dy
-            run = 0
-            while 0 <= nx < SZ and 0 <= ny < SZ and b.get_cell((nx, ny)) == PRIMED:
-                run += 1
-                nx += dx
-                ny += dy
-            if run >= 2:
-                pts = cpt[min(run, 7)]
-                if pts > best:
-                    best = pts
-        return best
+        if ev > 0.5:
+            return Move.search((bidx & 7, bidx >> 3))
+        return None

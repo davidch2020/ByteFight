@@ -38,15 +38,19 @@ def main():
     turn_count = final_board.turn_count
     print(f"{sim_time:.2f} seconds elapsed, {turn_count} rounds.")
 
-    records_dir = os.path.join(play_directory, "matches")
-    os.makedirs(records_dir, exist_ok=True)
-    i = 0
-    while True:
-        out_file = f"{player_a_name}_{player_b_name}_{i}.json"
-        out_path = os.path.join(records_dir, out_file)
-        if not os.path.exists(out_path):
-            break
-        i += 1
+    out_path = os.environ.get("MATCH_OUTPUT_PATH")
+    if out_path is None:
+        records_dir = os.path.join(play_directory, "matches")
+        os.makedirs(records_dir, exist_ok=True)
+        i = 0
+        while True:
+            out_file = f"{player_a_name}_{player_b_name}_{i}.json"
+            out_path = os.path.join(records_dir, out_file)
+            if not os.path.exists(out_path):
+                break
+            i += 1
+    else:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     with open(out_path, "w") as fp:
         fp.write(get_history_json(final_board, rat_position_history, spawn_a, spawn_b, message_a, message_b))
