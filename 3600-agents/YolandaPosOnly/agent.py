@@ -1,9 +1,9 @@
 from collections.abc import Callable
-from typing import List, Tuple
+from typing import List, Set, Tuple
 import random
 import numpy as np
 
-from game import board, enums, rat
+from game import board, move, enums, rat
 from game.move import Move
 
 SEARCH_PROB_THRESHOLD = 0.55
@@ -232,55 +232,7 @@ class PlayerAgent:
         opponent_points = board.opponent_worker.get_points()
         points_score = new_points - opponent_points
 
-        next_moves = board.get_valid_moves()
-        carpet_count = 0
-        carpet_value = 0
-        for move in next_moves:
-            if move.move_type == enums.MoveType.CARPET:
-                carpet_points = enums.CARPET_POINTS_TABLE[move.roll_length]
-                if move.roll_length != 1:
-                    carpet_count += 1
-
-                carpet_value += carpet_points
-
-
-        carpet_count_score = carpet_count * 0.2
-        carpet_value_score = carpet_value * 0.05
-        
-        largest_carpet_value = self.best_carpet_points_now(board)
-        best_now_score = largest_carpet_value * 0.15
-        best_carpet_future = self.best_carpet_points_future(board)
-        best_future_score = best_carpet_future * 0.3
-
-        mobility_score = 0
-        for m in next_moves:
-            if m.move_type == enums.MoveType.PRIME:
-                mobility_score += 1
-            elif m.move_type == enums.MoveType.PLAIN:
-                mobility_score += 0.2
-
-        mobility_score *= 0.2
-
-        opponent_board = board.get_copy()
-        opponent_board.reverse_perspective()
-        opponent_best_potential = 0
-        for move in opponent_board.get_valid_moves():
-            if move.move_type == enums.MoveType.CARPET:
-                value = enums.CARPET_POINTS_TABLE[move.roll_length]
-            elif move.move_type == enums.MoveType.PRIME:
-                value = 1
-            elif move.move_type == enums.MoveType.PLAIN:
-                value = 0.2
-            else:
-                value = 0
-
-            opponent_best_potential = max(opponent_best_potential, value)
-
-        opponent_now_penalty = opponent_best_potential * 0.1
-
-        opponent_best_future = self.best_carpet_points_future(opponent_board)
-        opponent_future_penalty = opponent_best_future * 0.1
-
+        # Evaluate position using the value board
         my_pos = board.player_worker.get_location()    
         opp_pos = board.opponent_worker.get_location()
         value_board = self.build_value_board(board)
@@ -288,26 +240,12 @@ class PlayerAgent:
 
         score = (
             points_score
-            + carpet_count_score
-            + carpet_value_score
-            + best_now_score
-            + best_future_score
-            + mobility_score
-            - opponent_now_penalty
-            - opponent_future_penalty
             + position_score
         )
 
         return {
             "score": score,
             "points": points_score,
-            "carpet_count": carpet_count_score,
-            "carpet_value": carpet_value_score,
-            "best_now": best_now_score,
-            "best_future": best_future_score,
-            "mobility": mobility_score,
-            "opp_now": -opponent_now_penalty,
-            "opp_future": -opponent_future_penalty,
             "position": position_score,
         }
     

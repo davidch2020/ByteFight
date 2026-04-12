@@ -6,7 +6,6 @@ import numpy as np
 
 from game import board, move, enums, rat
 from game.move import Move
-from game.enums import loc_after_direction
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -17,59 +16,53 @@ SEARCH_PROB_FLOOR = 0.34
 SEARCH_EV_FLOOR = 0.5
 
 TIME_HARD_FLOOR = 2.5
-MAX_DEPTH = 9
+MAX_DEPTH = 7
 MIN_DEPTH = 3
-
-# Carpet points (avoid dict lookup in hot loop)
-CPT = (0, -1, 2, 4, 6, 10, 15, 21)  # index by roll_length, 0 unused
 
 
 class PlayerAgent:
     """
-    Built on V4's proven core — clean minimax/alpha-beta with flat-EV rat search.
+    Expectiminimax agent targeting Carrie-level play.
 
-    Targeted additions over V4 (each one justified by what it costs vs gains):
-
-    1. Deeper search (MAX_DEPTH=9) with aggressive time usage.
-       V4 was capped at 7 and used conservative time budgets. With 4 minutes
-       total and ~40 turns, we can afford 6s/turn average.
-
-    2. Full chance-node expansion for rat search AT ROOT ONLY.
-       Properly evaluates hit/miss branches where it matters most (the actual
-       decision), zero cost inside the tree.
-
-    3. Dynamic search thresholds based on score margin.
-       When winning big, be conservative. When losing, take risks.
-
-    4. Precomputed belief propagation (no matrix multiply in tree).
-       belief @ T is expensive. Precompute once.
-
-    5. Cell potential used for prime ordering at root.
-       Help alpha-beta find the best prime first.
-
-    Everything else stays V4-simple. No TT, no killers, no history table,
-    no quiescence, no Zobrist — the overhead of these in Python costs more
-    than they save at the depths we actually reach.
+    Architecture
+    ------------
+    1.  HMM belief tracking for the rat (predict + sensor update each turn).
+    2.  Per-turn precomputation of a *cell potential map*: for every cell on
+        the board, estimate how many carpet points it contributes to (if
+        already primed) or could contribute to (if primed in the future),
+        discounted by distance from the player.  This is what Carrie's
+        "potential of each cell and its distance from the bot" refers to.
+    3.  Iterative-deepening expectiminimax with alpha-beta pruning.
+        - At max nodes the best rat-search move is a candidate alongside
+          movement moves, evaluated as a flat EV from the current belief.
+        - The heuristic uses the precomputed potential map for O(local)
+          evaluation instead of scanning the whole board at every leaf.
+    4.  Move ordering: carpet (by points) > prime > plain.
     """
 
     def __init__(self, board_obj, transition_matrix=None, time_left: Callable = None):
         self.T = np.array(transition_matrix, dtype=np.float64)
-        self.SZ = enums.BOARD_SIZE
+        self.SZ = enums.BOARD_SIZE  # 8
 
+        # Rat spawn prior: placed at (0,0), 1000 free steps.
         self.initial_belief = np.zeros(64, dtype=np.float64)
         self.initial_belief[0] = 1.0
         for _ in range(1000):
             self.initial_belief = self.initial_belief @ self.T
         self.belief = self.initial_belief.copy()
 
+        # Fast carpet-points lookup
         self._cpt = enums.CARPET_POINTS_TABLE
 
-        # Per-turn caches
-        self._cell_pot = None
-        self._precomputed_beliefs = None
+        # Per-turn caches (set in _precompute)
+        self._cell_pot = None        # (SZ, SZ) float — cell potential map
+        self._is_primed = None       # (SZ, SZ) bool grid
+        self._grid = None            # (SZ, SZ) CellType grid
 
         self.nodes_visited = 0
 
+    # ------------------------------------------------------------------
+    # Geometry
     # ------------------------------------------------------------------
     def _idx(self, loc):
         return loc[1] * self.SZ + loc[0]
@@ -82,6 +75,8 @@ class PlayerAgent:
         return b / s if s > 0 else self.initial_belief.copy()
 
     # ------------------------------------------------------------------
+    # Entry points
+    # ------------------------------------------------------------------
     def commentate(self):
         return ""
 
@@ -89,19 +84,17 @@ class PlayerAgent:
         self.nodes_visited = 0
         t0 = time.time()
 
+        # 1. Belief update
         self._update_belief(b, sensor_data)
+
+        # 2. Precompute spatial data for this turn
         self._precompute(b)
 
-        # Precompute beliefs
-        max_d = MAX_DEPTH + 2
-        self._precomputed_beliefs = [None] * max_d
-        self._precomputed_beliefs[0] = self.belief.copy()
-        for d in range(1, max_d):
-            self._precomputed_beliefs[d] = self._precomputed_beliefs[d - 1] @ self.T
-
+        # 3. Iterative deepening search
         best = self._id_search(b, time_left, t0)
         if best is not None:
             return best
+
         return random.choice(b.get_valid_moves())
 
     # ------------------------------------------------------------------
@@ -123,8 +116,10 @@ class PlayerAgent:
             self.belief[self._idx(ol)] = 0.0
             self.belief = self._normalize(self.belief)
 
+        # Predict
         self.belief = self.belief @ self.T
 
+        # Sensor update
         wx, wy = b.player_worker.get_location()
         for i in range(64):
             cx, cy = i % self.SZ, i // self.SZ
@@ -138,18 +133,34 @@ class PlayerAgent:
         self.belief = self._normalize(self.belief)
 
     # ------------------------------------------------------------------
-    # Precompute
+    # Precompute spatial data (once per turn, before search)
     # ------------------------------------------------------------------
     def _precompute(self, b: board.Board):
-        SZ = self.SZ
-        px, py = b.player_worker.get_location()
+        """
+        Build the cell potential map — Carrie's core advantage.
 
+        For each cell we compute how many carpet points it participates in
+        (or would participate in if primed), considering contiguous primed
+        neighbours in all four cardinal directions.
+
+        The potential is discounted by Manhattan distance from our worker,
+        so nearby cells are more valuable.
+        """
+        SZ = self.SZ
+        pp = b.player_worker.get_location()
+        px, py = pp
+
+        # Snapshot the board into fast-access arrays
         is_p = [[False]*SZ for _ in range(SZ)]
         for y in range(SZ):
             for x in range(SZ):
                 if b.get_cell((x, y)) == enums.Cell.PRIMED:
                     is_p[y][x] = True
+        self._is_primed = is_p
 
+        # Precompute run lengths in each direction.
+        # run_L[y][x] = # of contiguous primed cells to the left of (x,y),
+        #               NOT including (x,y) itself.
         rL = [[0]*SZ for _ in range(SZ)]
         rR = [[0]*SZ for _ in range(SZ)]
         rU = [[0]*SZ for _ in range(SZ)]
@@ -170,7 +181,8 @@ class PlayerAgent:
                 if is_p[y+1][x]:
                     rD[y][x] = rD[y+1][x] + 1
 
-        pot = [[0.0]*SZ for _ in range(SZ)]  # plain list, not numpy
+        # Build potential map
+        pot = np.zeros((SZ, SZ), dtype=np.float64)
         cpt = self._cpt
 
         for y in range(SZ):
@@ -180,25 +192,35 @@ class PlayerAgent:
                 discount = 1.0 / (1.0 + 0.3 * d)
 
                 if ct == enums.Cell.PRIMED:
+                    # Best run through this cell
                     h = 1 + rL[y][x] + rR[y][x]
                     v = 1 + rU[y][x] + rD[y][x]
                     best = min(max(h, v), 7)
                     pts = cpt[best] if best >= 2 else 0
-                    pot[y][x] = max(pts, 0) * discount
+                    pot[y, x] = max(pts, 0) * discount
+
                 elif ct == enums.Cell.SPACE:
+                    # Hypothetical: if we primed this cell, what run would it join?
                     h = 1 + rL[y][x] + rR[y][x]
                     v = 1 + rU[y][x] + rD[y][x]
                     hp = cpt[min(h, 7)] if h >= 2 else 0
                     vp = cpt[min(v, 7)] if v >= 2 else 0
                     best_p = max(hp, vp, 0)
+                    # Even isolated cells have small future value
                     if best_p == 0:
                         best_p = 0.25
-                    pot[y][x] = best_p * discount
+                    pot[y, x] = best_p * discount
+
+                # CARPET and BLOCKED → 0
 
         self._cell_pot = pot
+        self._rL = rL
+        self._rR = rR
+        self._rU = rU
+        self._rD = rD
 
     # ------------------------------------------------------------------
-    # Iterative deepening — use the time budget aggressively
+    # Iterative deepening
     # ------------------------------------------------------------------
     def _id_search(self, b, time_left, t0):
         best_move = None
@@ -208,93 +230,46 @@ class PlayerAgent:
         if len(cands) == 1:
             return cands[0]
 
-        turns_left = b.player_worker.turns_left
+        root_pts = b.player_worker.get_points()
 
         for depth in range(MIN_DEPTH, MAX_DEPTH + 1):
-            rem = time_left()
-            if rem < TIME_HARD_FLOOR + 0.5:
+            if time_left() < TIME_HARD_FLOOR + 1.5:
                 break
 
             it0 = time.time()
-            mv, sc = self._root(b, cands, depth, time_left)
+            mv, sc = self._root(b, cands, root_pts, depth, time_left)
             it_dur = time.time() - it0
 
             if mv is not None:
                 best_move = mv
 
             rem = time_left()
+            turns = max(b.player_worker.turns_left, 1)
+            budget = (rem - TIME_HARD_FLOOR) / turns
 
-            # Non-linear time budget
-            if turns_left <= 5:
-                budget_frac = 0.30
-            elif turns_left <= 15:
-                budget_frac = 0.07
-            elif turns_left <= 25:
-                budget_frac = 0.05
-            else:
-                budget_frac = 0.03
-
-            turn_budget = (rem - TIME_HARD_FLOOR) * budget_frac
-
-            # Will next iteration finish in time?
-            if it_dur * 4 > (rem - TIME_HARD_FLOOR):
+            if rem < TIME_HARD_FLOOR + it_dur * 6:
                 break
-            if (time.time() - t0) > turn_budget and depth >= MIN_DEPTH:
+            if (time.time() - t0) > budget * 1.5 and depth >= MIN_DEPTH:
                 break
 
         return best_move
 
     # ------------------------------------------------------------------
-    # Root — full chance node for search, smart prime ordering
+    # Root search
     # ------------------------------------------------------------------
-    def _root(self, b, cands, depth, time_left):
-        ordered = self._order_root(b, cands)
+    def _root(self, b, cands, root_pts, depth, time_left):
+        ordered = self._order(cands)
         best_move = None
         best_sc = float('-inf')
         alpha = float('-inf')
         beta = float('inf')
 
-        belief = self._precomputed_beliefs[0]
-        margin = b.player_worker.points - b.opponent_worker.points
-
-        # Dynamic search threshold
-        if margin >= 8:
-            prob_floor = 0.45
-        elif margin <= -8:
-            prob_floor = 0.20
-        else:
-            prob_floor = 0.34
-
-        best_idx = int(belief.argmax())
-        p = float(belief[best_idx])
-        raw_ev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-
-        if p >= prob_floor and raw_ev > 0 and depth >= 2:
-            search_move = Move.search(self._loc(best_idx))
-
-            # HIT branch
-            nb_hit = b.forecast_move(search_move)
-            if nb_hit is not None:
-                nb_hit.reverse_perspective()
-                hit_val = self._emm(nb_hit, float('-inf'), float('inf'),
-                                    depth - 1, False, time_left) + RAT_FIND_PTS
-            else:
-                hit_val = RAT_FIND_PTS
-
-            # MISS branch
-            nb_miss = b.forecast_move(search_move)
-            if nb_miss is not None:
-                nb_miss.reverse_perspective()
-                miss_val = self._emm(nb_miss, float('-inf'), float('inf'),
-                                     depth - 1, False, time_left) + RAT_MISS_PTS
-            else:
-                miss_val = RAT_MISS_PTS
-
-            search_sc = p * hit_val + (1.0 - p) * miss_val
-            if search_sc > best_sc:
-                best_sc = search_sc
-                best_move = search_move
-                alpha = max(alpha, best_sc)
+        # Rat search candidate
+        sm, sev = self._rat_search_ev()
+        if sm is not None and sev > best_sc:
+            best_sc = sev
+            best_move = sm
+            alpha = max(alpha, best_sc)
 
         for m in ordered:
             if time_left() < TIME_HARD_FLOOR:
@@ -303,7 +278,7 @@ class PlayerAgent:
             if nb is None:
                 continue
             nb.reverse_perspective()
-            sc = self._emm(nb, alpha, beta, depth - 1, False, time_left)
+            sc = self._emm(nb, alpha, beta, root_pts, depth - 1, False, time_left)
             if sc > best_sc:
                 best_sc = sc
                 best_move = m
@@ -311,35 +286,49 @@ class PlayerAgent:
 
         return best_move, best_sc
 
+    def _rat_search_ev(self):
+        idx = int(np.argmax(self.belief))
+        p = self.belief[idx]
+        ev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
+        if p >= SEARCH_PROB_FLOOR and ev >= SEARCH_EV_FLOOR:
+            return Move.search(self._loc(idx)), ev
+        return None, float('-inf')
+
     # ------------------------------------------------------------------
-    # EMM — V4-clean, no TT, no killers, no overhead
+    # Expectiminimax
     # ------------------------------------------------------------------
-    def _emm(self, b, alpha, beta, depth, maximizing, time_left):
+    def _emm(self, b, alpha, beta, root_pts, depth, maximizing, time_left):
         self.nodes_visited += 1
 
         if depth <= 0 or time_left() < TIME_HARD_FLOOR:
             if not maximizing:
                 b.reverse_perspective()
-            return self._eval(b)
+            return self._eval(b, root_pts)
 
         moves = b.get_valid_moves()
         if not moves:
             if not maximizing:
                 b.reverse_perspective()
-            return self._eval(b)
+            return self._eval(b, root_pts)
 
-        ordered = self._order_fast(moves)
+        ordered = self._order(moves)
 
         if maximizing:
             best = float('-inf')
 
-            # Flat EV for rat search (same as V4 — cheap, proven)
+            # Rat-search chance node at max nodes
             idx = int(np.argmax(self.belief))
             p = self.belief[idx]
             sev = RAT_FIND_PTS * p + RAT_MISS_PTS * (1.0 - p)
-            margin = b.player_worker.points - b.opponent_worker.points
-            pf = 0.45 if margin >= 8 else (0.20 if margin <= -8 else 0.34)
-            if p >= pf and sev > SEARCH_EV_FLOOR:
+            if p >= SEARCH_PROB_FLOOR and sev >= SEARCH_EV_FLOOR:
+                # Search doesn't change the board. The value is:
+                # the expected points from the search (sev) plus
+                # the continuation value where the opponent plays next
+                # on the unchanged board.
+                # To avoid the cost of a recursive call for the search
+                # branch (which would be on the same board), we use the
+                # raw sev as the search value. This is a sound approximation
+                # because the board state is unchanged — only the score shifts.
                 best = max(best, sev)
                 if best >= beta:
                     return best
@@ -352,9 +341,8 @@ class PlayerAgent:
                 if nb is None:
                     continue
                 nb.reverse_perspective()
-                val = self._emm(nb, alpha, beta, depth - 1, False, time_left)
-                if val > best:
-                    best = val
+                val = self._emm(nb, alpha, beta, root_pts, depth - 1, False, time_left)
+                best = max(best, val)
                 if best >= beta:
                     return best
                 alpha = max(alpha, best)
@@ -368,9 +356,8 @@ class PlayerAgent:
                 if nb is None:
                     continue
                 nb.reverse_perspective()
-                val = self._emm(nb, alpha, beta, depth - 1, True, time_left)
-                if val < best:
-                    best = val
+                val = self._emm(nb, alpha, beta, root_pts, depth - 1, True, time_left)
+                best = min(best, val)
                 if best <= alpha:
                     return best
                 beta = min(beta, best)
@@ -379,71 +366,60 @@ class PlayerAgent:
     # ------------------------------------------------------------------
     # Move ordering
     # ------------------------------------------------------------------
-    def _order_root(self, b, moves):
-        """Root: use cell potential to rank primes. Only called once."""
-        pot = self._cell_pot
-        ploc = b.player_worker.position
-        cpt = self._cpt
-
+    def _order(self, moves):
         def key(m):
             if m.move_type == enums.MoveType.CARPET:
-                return (3, cpt.get(m.roll_length, 0))
+                return (3, self._cpt.get(m.roll_length, 21))
             if m.move_type == enums.MoveType.PRIME:
-                dest = loc_after_direction(ploc, m.direction)
-                return (2, pot[dest[1]][dest[0]])
+                # Use precomputed cell potential to order primes.
+                # A prime move departs from the current cell (priming it)
+                # and lands on the destination. We want to prime cells
+                # that extend long runs, so score by the destination's
+                # potential — but the primed cell is actually the ORIGIN,
+                # not the destination. Since we don't have origin info on
+                # the Move object, use a flat priority. The tree will sort
+                # out the best prime.
+                return (2, 0)
             if m.move_type == enums.MoveType.PLAIN:
                 return (1, 0)
             return (0, 0)
         return sorted(moves, key=key, reverse=True)
 
-    def _order_fast(self, moves):
-        """In-tree: minimal overhead. Carpet by value > prime > plain."""
-        cpt = self._cpt
-        def key(m):
-            mt = m.move_type
-            if mt == enums.MoveType.CARPET:
-                return (3, cpt.get(m.roll_length, 0))
-            if mt == enums.MoveType.PRIME:
-                return (2, 0)
-            if mt == enums.MoveType.PLAIN:
-                return (1, 0)
-            return (0, 0)
-        return sorted(moves, key=key, reverse=True)
-
     # ------------------------------------------------------------------
-    # Heuristic — V4 style, proven, fast
+    # Heuristic evaluation
     # ------------------------------------------------------------------
-    def _eval(self, b: board.Board) -> float:
-        pp = b.player_worker.points
-        op = b.opponent_worker.points
+    def _eval(self, b: board.Board, root_pts: int) -> float:
+        pp = b.player_worker.get_points()
+        op = b.opponent_worker.get_points()
         ploc = b.player_worker.get_location()
         oloc = b.opponent_worker.get_location()
         turns = b.player_worker.turns_left
 
-        margin = pp - op
-        score = float(margin)
+        score = 0.0
 
-        # Available carpet + mobility
+        # --- 1. Point margin (most important) ---
+        margin = pp - op
+        score += margin
+
+        # --- 2. Available carpet + mobility from current moves ---
         moves = b.get_valid_moves()
         best_carpet = 0.0
         carpet_sum = 0.0
         n_prime = 0
         n_plain = 0
         n_carpet = 0
-        cpt = self._cpt
 
         for m in moves:
-            mt = m.move_type
-            if mt == enums.MoveType.CARPET:
-                pts = cpt[m.roll_length]
+            if m.move_type == enums.MoveType.CARPET:
+                pts = self._cpt[m.roll_length]
                 if pts > best_carpet:
                     best_carpet = pts
                 if pts > 0:
                     carpet_sum += pts
                     n_carpet += 1
-            elif mt == enums.MoveType.PRIME:
+            elif m.move_type == enums.MoveType.PRIME:
                 n_prime += 1
-            elif mt == enums.MoveType.PLAIN:
+            elif m.move_type == enums.MoveType.PLAIN:
                 n_plain += 1
 
         score += best_carpet * 0.45
@@ -452,11 +428,15 @@ class PlayerAgent:
         score += n_prime * 0.25
         score += n_plain * 0.04
 
-        # Cell potential (local, distance <= 4)
-        pot = self._cell_pot
-        if pot is not None:
+        # --- 3. Cell potential (Carrie-style spatial heuristic) ---
+        # The precomputed potential map is from the root board state, so it's
+        # slightly stale at deeper leaves. But the board changes only a few
+        # cells per ply, so it's a good approximation. We use it as a light
+        # directional signal, not a dominant term.
+        if self._cell_pot is not None:
             px, py = ploc
             SZ = self.SZ
+            # Player's local potential (within Manhattan distance 4)
             my_pot = 0.0
             for dy in range(-4, 5):
                 ny = py + dy
@@ -467,20 +447,21 @@ class PlayerAgent:
                     nx = px + dx
                     if nx < 0 or nx >= SZ:
                         continue
-                    my_pot += pot[ny][nx]
+                    my_pot += self._cell_pot[ny, nx]
             score += my_pot * 0.05
 
-        # Opponent carpet threat (immediate only — fast)
-        opp_threat = self._opp_threat(b, oloc)
+        # --- 4. Opponent direct carpet threat ---
+        # Compute from the ACTUAL leaf board, not the stale cache.
+        opp_threat = self._opp_threat_live(b, oloc)
         score -= opp_threat * 0.22
 
-        # Endgame amplification
+        # --- 5. Endgame amplification ---
         if turns <= 10:
             u = (11 - turns) / 10.0
             score += margin * 0.2 * u
             score += best_carpet * 0.35 * u
 
-        # Rat signal
+        # --- 6. Rat search opportunity ---
         rp = float(np.max(self.belief))
         rev = RAT_FIND_PTS * rp + RAT_MISS_PTS * (1.0 - rp)
         if rev > 0:
@@ -488,7 +469,11 @@ class PlayerAgent:
 
         return score
 
-    def _opp_threat(self, b, oloc):
+    def _opp_threat_live(self, b: board.Board, oloc: Tuple[int, int]) -> float:
+        """
+        Max carpet run the opponent could roll right now.
+        Reads directly from the board (not stale cache) for accuracy.
+        """
         ox, oy = oloc
         best = 0.0
         SZ = self.SZ
