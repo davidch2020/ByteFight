@@ -1,0 +1,40 @@
+{
+  "variants": [
+    {
+      "name": "YolandaV8EvalBase",
+      "weights": {
+        "EVAL_MARGIN_BASE": 1.0,
+        "EVAL_MARGIN_TURNS": 0.12,
+        "EVAL_SELF_CARPET": 0.5,
+        "EVAL_OPP_CARPET": 0.3,
+        "EVAL_PRIMED_COUNT": 0.12,
+        "EVAL_CAN_PRIME": 0.4,
+        "EVAL_ADJ_PRIMED": 0.2
+      }
+    },
+    {
+      "name": "YolandaV8EvalCarpetHeavy",
+      "weights": {
+        "EVAL_MARGIN_BASE": 1.0,
+        "EVAL_MARGIN_TURNS": 0.12,
+        "EVAL_SELF_CARPET": 0.6,
+        "EVAL_OPP_CARPET": 0.4,
+        "EVAL_PRIMED_COUNT": 0.1,
+        "EVAL_CAN_PRIME": 0.35,
+        "EVAL_ADJ_PRIMED": 0.24
+      }
+    },
+    {
+      "name": "YolandaV8EvalPrimeLean",
+      "weights": {
+        "EVAL_MARGIN_BASE": 1.0,
+        "EVAL_MARGIN_TURNS": 0.12,
+        "EVAL_SELF_CARPET": 0.52,
+        "EVAL_OPP_CARPET": 0.32,
+        "EVAL_PRIMED_COUNT": 0.08,
+        "EVAL_CAN_PRIME": 0.45,
+        "EVAL_ADJ_PRIMED": 0.28
+      }
+    }
+  ]
+}

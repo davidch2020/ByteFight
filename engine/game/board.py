@@ -90,39 +90,38 @@ class Board:
 
         my_loc = worker.get_location()
 
-        match move.move_type:
-            case MoveType.PLAIN:
-                next_loc = loc_after_direction(my_loc, move.direction)
-                return not self.is_cell_blocked(next_loc)
+        if move.move_type == MoveType.PLAIN:
+            next_loc = loc_after_direction(my_loc, move.direction)
+            return not self.is_cell_blocked(next_loc)
 
-            case MoveType.PRIME:
-                next_loc = loc_after_direction(my_loc, move.direction)
-                if self.is_cell_blocked(next_loc):
+        elif move.move_type == MoveType.PRIME:
+            next_loc = loc_after_direction(my_loc, move.direction)
+            if self.is_cell_blocked(next_loc):
+                return False
+            # Can only prime if current cell is SPACE (not already PRIMED or CARPETED)
+            bit_mask = 1 << self._loc_to_bit_index(my_loc)
+            if (self._primed_mask | self._carpet_mask) & bit_mask:
+                return False
+            return True
+
+        elif move.move_type == MoveType.CARPET:
+            if move.roll_length < 1 or move.roll_length > BOARD_SIZE - 1:
+                return False
+
+            # roll_length 1 = carpet the next square in the direction, etc.
+            current_loc = my_loc
+            for _ in range(1, move.roll_length + 1):
+                current_loc = loc_after_direction(current_loc, move.direction)
+
+                if not self.is_cell_carpetable(current_loc):
                     return False
-                # Can only prime if current cell is SPACE (not already PRIMED or CARPETED)
-                bit_mask = 1 << self._loc_to_bit_index(my_loc)
-                if (self._primed_mask | self._carpet_mask) & bit_mask:
-                    return False
-                return True
 
-            case MoveType.CARPET:
-                if move.roll_length < 1 or move.roll_length > BOARD_SIZE - 1:
-                    return False
+            return True
 
-                # roll_length 1 = carpet the next square in the direction, etc.
-                current_loc = my_loc
-                for _ in range(1, move.roll_length + 1):
-                    current_loc = loc_after_direction(current_loc, move.direction)
-
-                    if not self.is_cell_carpetable(current_loc):
-                        return False
-
-                return True
-
-            case MoveType.SEARCH:
-                if not self.is_valid_cell(move.search_loc):
-                    return False
-                return True
+        elif move.move_type == MoveType.SEARCH:
+            if not self.is_valid_cell(move.search_loc):
+                return False
+            return True
             
         return False
         
@@ -237,25 +236,24 @@ class Board:
                 if not self.is_valid_move(move):
                     return False
                 
-            match move.move_type:
-                case MoveType.PLAIN:
-                    self.player_worker.position = loc_after_direction(self.player_worker.get_location(), move.direction)
-                case MoveType.PRIME:
-                    self.set_cell(self.player_worker.get_location(), Cell.PRIMED)
-                    self.player_worker.position = loc_after_direction(self.player_worker.get_location(), move.direction)
-                    self.player_worker.increment_points(amount=1)
-                case MoveType.CARPET:
-                    current_loc = self.player_worker.get_location()
-                    for _ in range(1, move.roll_length + 1):
-                        current_loc = loc_after_direction(current_loc, move.direction)
-                        self.set_cell(current_loc, Cell.CARPET)
+            if move.move_type == MoveType.PLAIN:
+                self.player_worker.position = loc_after_direction(self.player_worker.get_location(), move.direction)
+            elif move.move_type == MoveType.PRIME:
+                self.set_cell(self.player_worker.get_location(), Cell.PRIMED)
+                self.player_worker.position = loc_after_direction(self.player_worker.get_location(), move.direction)
+                self.player_worker.increment_points(amount=1)
+            elif move.move_type == MoveType.CARPET:
+                current_loc = self.player_worker.get_location()
+                for _ in range(1, move.roll_length + 1):
+                    current_loc = loc_after_direction(current_loc, move.direction)
+                    self.set_cell(current_loc, Cell.CARPET)
 
-                    points = CARPET_POINTS_TABLE[move.roll_length]
-                    self.player_worker.increment_points(amount=points)
-                    self.player_worker.position = current_loc
-                case MoveType.SEARCH:
-                    # handled by game runner
-                    pass
+                points = CARPET_POINTS_TABLE[move.roll_length]
+                self.player_worker.increment_points(amount=points)
+                self.player_worker.position = current_loc
+            elif move.move_type == MoveType.SEARCH:
+                # handled by game runner
+                pass
             
             self.end_turn(timer)
             
@@ -573,6 +571,5 @@ class Board:
         bit_mask = 1 << bit_index
 
         return bool(self._primed_mask & bit_mask)
-
 
 

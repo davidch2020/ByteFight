@@ -9,3 +9,6 @@ __pycache__/
 depth_sweep.log
 depth_sweep_results.txt
 bot_matches/
+.claude/
+3600-agents/Yolanda/build/
+3600-agents/Yolanda/yolanda_search_ext*.so

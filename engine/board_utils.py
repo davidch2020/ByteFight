@@ -152,17 +152,16 @@ def get_history_dict(board: Board, rat_position_history, spawn_a, spawn_b, errlo
     # Convert MoveType enums to strings
     left_behind = []
     for val in history_dict["left_behind_enums"]:
-        match val:
-            case MoveType.PLAIN:
-                left_behind.append("plain")
-            case MoveType.PRIME:
-                left_behind.append("prime")
-            case MoveType.CARPET:
-                left_behind.append("carpet")
-            case MoveType.SEARCH:
-                left_behind.append("search")
-            case _:
-                left_behind.append("plain")
+        if val == MoveType.PLAIN:
+            left_behind.append("plain")
+        elif val == MoveType.PRIME:
+            left_behind.append("prime")
+        elif val == MoveType.CARPET:
+            left_behind.append("carpet")
+        elif val == MoveType.SEARCH:
+            left_behind.append("search")
+        else:
+            left_behind.append("plain")
     history_dict["left_behind"] = left_behind
     history_dict.pop("left_behind_enums", None)
 

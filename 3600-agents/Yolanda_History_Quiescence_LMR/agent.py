@@ -11,7 +11,7 @@ from game.move import Move
 # ---------------------------------------------------------------------------
 # Constants — localized to avoid module attribute lookups in hot paths
 # ---------------------------------------------------------------------------
-SEARCH_PROB_THRESHOLD = 0.34
+SEARCH_PROB_THRESHOLD = 0.5
 RAT_FIND_PTS = 4
 RAT_MISS_PTS = 2
 
@@ -19,11 +19,13 @@ RAT_MISS_PTS = 2
 # Sum of 17.5 * 0.93^(t-1) for t=1..40 ≈ 236s, leaving ~4s safety margin.
 # Zero turns get clamped — every turn uses its full budget.
 # Turn 1: 17.5s, Turn 10: 9.1s, Turn 20: 4.4s, Turn 40: 1.0s
-TIME_BASE = 17.5
-TIME_DECAY = 0.93
-TIME_FLOOR = 1.5          # Never let total remaining drop below this
+TIME_BASE = 8.0
+TIME_DECAY = 0.99
+TIME_FLOOR = 0.75         # Keep only a small reserve; spend the clock
+PACE_FACTOR = 1.20
+QSEARCH_DEPTH = 4
 
-MAX_DEPTH = 20             # Iterative deepening stops on time, not this
+MAX_DEPTH = 40             # Iterative deepening stops on time, not this
 
 # Carpet points as a list for O(1) index lookup (index 0 unused)
 _CPT = [0, -1, 2, 4, 6, 10, 15, 21]  # index = roll_length
@@ -162,7 +164,7 @@ def _eval_board(b):
     return score
 
 
-def _order_moves(moves, tt_hint, killers):
+def _order_moves(moves, tt_hint, killers, history_scores):
     """Bucket-sort moves. ~3x faster than sorted() with a closure in Python.
     TT hint → killers → carpets (by length desc) → primes → plains."""
     front = []
@@ -185,9 +187,19 @@ def _order_moves(moves, tt_hint, killers):
         else:
             plains.append(m)
 
-    # Sort carpets by roll_length descending (longer = more points)
+    # Longer carpets still come first, but moves that often caused cutoffs
+    # get a small bonus so we try them earlier.
     if len(carpets) > 1:
-        carpets.sort(key=lambda m: m.roll_length, reverse=True)
+        carpets.sort(
+            key=lambda m: (m.roll_length, history_scores.get(_move_key(m), 0)),
+            reverse=True,
+        )
+
+    # For prime/plain moves, use history score as the main ordering signal.
+    if len(primes) > 1:
+        primes.sort(key=lambda m: history_scores.get(_move_key(m), 0), reverse=True)
+    if len(plains) > 1:
+        plains.sort(key=lambda m: history_scores.get(_move_key(m), 0), reverse=True)
 
     # Pull killer matches to front
     if killers:
@@ -251,6 +263,8 @@ class PlayerAgent:
 
         self.tt = TT()
         self.killer_moves = {}   # depth -> [(mt, roll, dir), ...]
+        # Moves that caused cutoffs before get tried earlier later.
+        self.history_scores = {}
         self.turn_number = 0
 
     def commentate(self):
@@ -275,8 +289,10 @@ class PlayerAgent:
 
         # 3. Time budget for this turn
         budget = TIME_BASE * (TIME_DECAY ** (self.turn_number - 1))
-        remaining = time_left() - TIME_FLOOR
-        alloc = max(0.05, min(budget, remaining))
+        remaining = max(0.0, time_left() - TIME_FLOOR)
+        turns_left = max(1, b.player_worker.turns_left)
+        pace_budget = (remaining / turns_left) * PACE_FACTOR
+        alloc = max(0.05, min(max(budget, pace_budget), remaining))
         deadline = time_module.time() + alloc
 
         # 4. Search
@@ -323,7 +339,7 @@ class PlayerAgent:
         rk = self._board_key(b, True)
         _, tt_hint, _ = self.tt.lookup(rk, depth, -999999.0, 999999.0)
         killers = self.killer_moves.get(depth, [])
-        ordered = _order_moves(cands, tt_hint, killers)
+        ordered = _order_moves(cands, tt_hint, killers, self.history_scores)
 
         best_move = None
         best_sc = -999999.0
@@ -358,6 +374,53 @@ class PlayerAgent:
 
         return best_move, best_sc
 
+    def _quiescence(self, b, alpha, beta, qdepth, deadline):
+        # Stop immediately if we are out of time.
+        if time_module.time() >= deadline:
+            return None
+
+        # A finished game can use the normal eval directly.
+        if b.winner is not None:
+            return _eval_board(b)
+
+        # "Stand pat" means: if we stop here, how good is the board now?
+        stand_pat = _eval_board(b)
+        if stand_pat >= beta:
+            return beta
+        if stand_pat > alpha:
+            alpha = stand_pat
+
+        # Do not extend forever.
+        if qdepth <= 0:
+            return alpha
+
+        # Only extend tactical carpet moves, and ignore CARPET(1) noise.
+        carpet_moves = [
+            m for m in b.get_valid_moves()
+            if m.move_type == _CARPET_MT and m.roll_length >= 2
+        ]
+        carpet_moves.sort(key=lambda m: m.roll_length, reverse=True)
+
+        for m in carpet_moves:
+            if time_module.time() >= deadline:
+                return None
+            nb = b.forecast_move(m)
+            if nb is None:
+                continue
+            nb.reverse_perspective()
+
+            score = self._quiescence(nb, -beta, -alpha, qdepth - 1, deadline)
+            if score is None:
+                return None
+            score = -score
+
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+
+        return alpha
+
     # ------------------------------------------------------------------
     # Alpha-Beta
     # ------------------------------------------------------------------
@@ -365,8 +428,13 @@ class PlayerAgent:
         if time_module.time() >= deadline:
             return None
 
-        # Leaf
-        if depth <= 0 or b.winner is not None:
+        # Normal leaf: extend only tactical carpet positions a little longer.
+        if depth <= 0:
+            if not maximizing:
+                b.reverse_perspective()
+            return self._quiescence(b, alpha, beta, QSEARCH_DEPTH, deadline)
+
+        if b.winner is not None:
             if not maximizing:
                 b.reverse_perspective()
             return _eval_board(b)
@@ -384,13 +452,14 @@ class PlayerAgent:
             return _eval_board(b)
 
         killers = self.killer_moves.get(depth, [])
-        ordered = _order_moves(moves, tt_hint, killers)
+        ordered = _order_moves(moves, tt_hint, killers, self.history_scores)
         orig_alpha = alpha
         best_mk = None
         _now = time_module.time
 
         if maximizing:
             best = -999999.0
+            n_searched = 0
             for m in ordered:
                 if _now() >= deadline:
                     return None
@@ -398,7 +467,25 @@ class PlayerAgent:
                 if nb is None:
                     continue
                 nb.reverse_perspective()
-                val = self._ab(nb, alpha, beta, depth - 1, False, deadline)
+
+                # Reduce later plain moves only after 2 full-depth searches.
+                use_lmr = (
+                    depth >= 3 and
+                    n_searched >= 2 and
+                    m.move_type == _PLAIN_MT
+                )
+
+                if use_lmr:
+                    # Cheap reduced-depth scout search first.
+                    val = self._ab(nb, alpha, alpha + 1, depth - 2, False, deadline)
+
+                    # If it still looks good, re-search at full depth.
+                    if val is not None and val > alpha:
+                        val = self._ab(nb, alpha, beta, depth - 1, False, deadline)
+                else:
+                    val = self._ab(nb, alpha, beta, depth - 1, False, deadline)
+
+                n_searched += 1
                 if val is None:
                     return None
                 if val > best:
@@ -408,9 +495,12 @@ class PlayerAgent:
                     alpha = best
                 if alpha >= beta:
                     self._add_killer(depth, m)
+                    # Remember this move globally because it pruned the tree.
+                    self._add_history(m, depth)
                     break
         else:
             best = 999999.0
+            n_searched = 0
             for m in ordered:
                 if _now() >= deadline:
                     return None
@@ -418,7 +508,25 @@ class PlayerAgent:
                 if nb is None:
                     continue
                 nb.reverse_perspective()
-                val = self._ab(nb, alpha, beta, depth - 1, True, deadline)
+
+                # Reduce later plain moves only after 2 full-depth searches.
+                use_lmr = (
+                    depth >= 3 and
+                    n_searched >= 2 and
+                    m.move_type == _PLAIN_MT
+                )
+
+                if use_lmr:
+                    # Cheap reduced-depth scout search first.
+                    val = self._ab(nb, beta - 1, beta, depth - 2, True, deadline)
+
+                    # If it still looks dangerous, re-search at full depth.
+                    if val is not None and val < beta:
+                        val = self._ab(nb, alpha, beta, depth - 1, True, deadline)
+                else:
+                    val = self._ab(nb, alpha, beta, depth - 1, True, deadline)
+
+                n_searched += 1
                 if val is None:
                     return None
                 if val < best:
@@ -428,6 +536,8 @@ class PlayerAgent:
                     beta = best
                 if alpha >= beta:
                     self._add_killer(depth, m)
+                    # Remember this move globally because it pruned the tree.
+                    self._add_history(m, depth)
                     break
 
         self.tt.store(key, depth, best, best_mk, orig_alpha, beta)
@@ -463,6 +573,11 @@ class PlayerAgent:
                 ks[0] = mk
             else:
                 ks.insert(0, mk)
+
+    def _add_history(self, m, depth):
+        # Reward moves that caused cutoffs. Deeper cutoffs matter more.
+        mk = _move_key(m)
+        self.history_scores[mk] = self.history_scores.get(mk, 0) + depth * depth
 
     # ------------------------------------------------------------------
     # Rat HMM (V5 logic, optimized access)
@@ -541,9 +656,9 @@ class PlayerAgent:
         px, py = b.player_worker.position
         ox, oy = b.opponent_worker.position
         bc = _best_carpet_run(b._primed_mask, px, py, ox, oy)
-        if bc > ev + 1:
+        if bc > ev + 2:
             return None
 
-        if ev > 0.5:
+        if ev > 0.0:
             return Move.search((bidx & 7, bidx >> 3))
         return None
