@@ -57,16 +57,16 @@ _HAS_NATIVE = _native_backend is not None
 
 
 def _native_tt_stats():
-    """Return native stats as a compact tuple, or None if unavailable."""
+    """Return TT stats as (hits, probes, stores), or None if unavailable."""
     if not _HAS_NATIVE or not hasattr(_native_backend, "tt_stats"):
         return None
     try:
         stats = _native_backend.tt_stats()
     except Exception:
         return None
-    if not isinstance(stats, tuple) or len(stats) != 4:
+    if not isinstance(stats, tuple) or len(stats) != 3:
         return None
-    return int(stats[0]), int(stats[1]), int(stats[2]), int(stats[3])
+    return int(stats[0]), int(stats[1]), int(stats[2])
 
 
 def _reset_native_tt_counters():
@@ -390,14 +390,14 @@ class PlayerAgent:
     def commentate(self):
         native_stats = _native_tt_stats()
         if native_stats is not None:
-            hits, probes, stores, last = native_stats
+            hits, probes, stores = native_stats
             rate = hits / probes if probes > 0 else 0.0
-            return f"S: {hits}/{probes} ({rate:.0%}), a={stores}, b={last}, c=1"
+            return f"CPP TT: {hits}/{probes} ({rate:.0%}), stores={stores}"
 
         t = self.tt
         total = t.hits + t.misses
         r = t.hits / total if total > 0 else 0
-        return f"S: {t.hits}/{total} ({r:.0%}), a={len(t.table)}, c=0"
+        return f"PY TT: {t.hits}/{total} ({r:.0%}), size={len(t.table)}"
 
     # ------------------------------------------------------------------
     # Entry

@@ -4,39 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstring>   // [TT] memset for TT clear
 #include <limits>
-#include <random>    // [TT] mt19937_64 for Zobrist key seeding
 #include <vector>
-
-// =============================================================================
-// HIGH-LEVEL OVERVIEW (where the changes are)
-// -----------------------------------------------------------------------------
-// This file is the same refactored search as before, with a Transposition Table
-// and Zobrist hashing added.  Every new / modified section is marked with [TT].
-//
-// What a TT does:
-//   1. Before searching a position, we hash the board to a 64-bit key and look
-//      up a cached result.  If the cached result was computed at >= our current
-//      depth and the alpha/beta bounds match, we return it immediately.  This
-//      prunes huge subtrees — the same positions often appear via different
-//      move orders ("transpositions").
-//   2. Even when the cached value is unusable (shallower depth), the entry
-//      still tells us the best move found last time.  We try that move first,
-//      which produces beta-cutoffs earlier and improves alpha-beta pruning.
-//
-// The Python side already had a TT.  This version puts it in the C++ path —
-// previously the C++ backend had no TT at all, which wasted a lot of work.
-//
-// New pieces added below:
-//   - Zobrist key arrays + `ensure_zobrist_ready()`   (seeded once per process)
-//   - `compute_hash()`                                (board state -> uint64)
-//   - `TTEntry` + fixed-size `g_tt` table             (1M entries, ~32 MB)
-//   - `tt_probe()` / `tt_store()`                     (depth-preferred replace)
-//   - TT probe/store + TT-hint move ordering in `search_branch` and
-//     `evaluate_root_choices`
-//   - `ensure_zobrist_ready()` called from `search_entrypoint`
-// =============================================================================
 
 namespace yolanda_ref {
 
@@ -83,150 +52,12 @@ static constexpr int kSearchMoveType = 3;
 static constexpr int kStepX[4] = {0, 1, 0, -1};
 static constexpr int kStepY[4] = {-1, 0, 1, 0};
 static constexpr int kCarpetPoints[8] = {0, -1, 2, 4, 6, 10, 15, 21};
-static constexpr int kMaxDepth = 80;
+static constexpr int kMaxDepth = 40;
 static constexpr int kQuietDepth = 4;
 static constexpr float kSearchProbThreshold = 0.5f;
 static constexpr float kRatFindPoints = 4.0f;
 static constexpr float kRatMissPoints = 2.0f;
 static constexpr float kInfinityScore = 1.0e9f;
-
-// =============================================================================
-// [TT] Transposition Table + Zobrist hashing
-// =============================================================================
-
-// One 64-bit random value per (feature, cell).  XOR-ing the values for every
-// feature present on the board gives a well-distributed 64-bit fingerprint of
-// the state.  These arrays are filled once at process start.
-static uint64_t zobrist_primed[64];
-static uint64_t zobrist_carpet[64];
-static uint64_t zobrist_ppos[64];
-static uint64_t zobrist_opos[64];
-static bool zobrist_initialized = false;
-
-// Fill the Zobrist tables once per process.  A deterministic seed means two
-// runs produce the same keys, which makes TT behavior reproducible.
-static void ensure_zobrist_ready() {
-    if (zobrist_initialized) return;
-    std::mt19937_64 rng(0xD3ADB33FULL);
-    for (int i = 0; i < 64; ++i) {
-        zobrist_primed[i] = rng();
-        zobrist_carpet[i] = rng();
-        zobrist_ppos[i]   = rng();
-        zobrist_opos[i]   = rng();
-    }
-    zobrist_initialized = true;
-}
-
-// Full hash recompute from a SearchState.  Simple, safe, ~15-30 ns per call.
-// Can be upgraded to an incremental XOR-in/XOR-out scheme later if needed.
-static uint64_t compute_hash(const SearchState& s) {
-    uint64_t h = 0;
-
-    // XOR in each set primed cell.
-    uint64_t p = s.primed_mask;
-    while (p) {
-        int bit = __builtin_ctzll(p);
-        h ^= zobrist_primed[bit];
-        p &= p - 1;
-    }
-    // XOR in each set carpet cell.
-    uint64_t c = s.carpet_mask;
-    while (c) {
-        int bit = __builtin_ctzll(c);
-        h ^= zobrist_carpet[bit];
-        c &= c - 1;
-    }
-    // Worker positions.  p_pos and o_pos live in separate arrays so "me at A,
-    // opp at B" hashes differently from "me at B, opp at A".
-    h ^= zobrist_ppos[s.py * 8 + s.px];
-    h ^= zobrist_opos[s.oy * 8 + s.ox];
-
-    // Scores and remaining turns affect the evaluation, so they must be part
-    // of the key — two otherwise-identical boards with different scores are
-    // different search states.  We use simple large-prime multipliers to mix.
-    h ^= uint64_t(s.p_points) * 0x9E3779B97F4A7C15ULL;
-    h ^= uint64_t(s.o_points) * 0xBF58476D1CE4E5B9ULL;
-    h ^= uint64_t(s.p_turns)  * 0x94D049BB133111EBULL;
-    h ^= uint64_t(s.o_turns)  * 0xD1B54A32D192ED03ULL;
-    return h;
-}
-
-// Bound classification for the stored value.
-//   EXACT = the true minimax score
-//   LOWER = a lower bound (fail-high: true score >= value)
-//   UPPER = an upper bound (fail-low:  true score <= value)
-static constexpr uint8_t kTTExact = 0;
-static constexpr uint8_t kTTLower = 1;
-static constexpr uint8_t kTTUpper = 2;
-
-// A TT slot.  Laid out small so we pack cache lines reasonably.
-struct TTEntry {
-    uint64_t    key;    // Zobrist hash.  key == 0 is the "empty slot" sentinel.
-    float       value;  // Stored score from the side-to-move's perspective.
-    EncodedMove best;   // Best move found at this position (for ordering).
-    int16_t     depth;  // Search depth used to produce `value`.
-    uint8_t     flag;   // EXACT / LOWER / UPPER.
-    uint8_t     _pad;
-};
-
-// Fixed-size table.  Power-of-two size lets us index with a bit mask
-// instead of %.  No heap allocation during search.
-static constexpr size_t kTTSize = 1 << 20;   // 1M entries
-static constexpr size_t kTTMask = kTTSize - 1;
-static TTEntry g_tt[kTTSize];                // zero-initialized by the loader
-
-// Instrumentation counters so the Python side can report TT activity.
-// These do not affect search behavior.
-static uint64_t g_tt_probes = 0;
-static uint64_t g_tt_hits = 0;
-static uint64_t g_tt_stores = 0;
-static int g_last_completed_depth = 0;
-
-// Probe: return the entry if the key matches, else null.
-static inline const TTEntry* tt_probe(uint64_t key) {
-    ++g_tt_probes;
-    const TTEntry& e = g_tt[key & kTTMask];
-    if (e.key == key) {
-        ++g_tt_hits;
-        return &e;
-    }
-    return nullptr;
-}
-
-// Store: depth-preferred replacement.  We only overwrite an existing slot if
-// the new result was searched at least as deep — this protects expensive
-// deep-search results from being clobbered by cheap shallow probes.
-static inline void tt_store(uint64_t key, int depth, float value,
-                            uint8_t flag, EncodedMove best) {
-    TTEntry& e = g_tt[key & kTTMask];
-    if (e.key != key || e.depth <= depth) {
-        ++g_tt_stores;
-        e.key   = key;
-        e.depth = static_cast<int16_t>(depth);
-        e.flag  = flag;
-        e.best  = best;
-        e.value = value;
-    }
-}
-
-// Optional: wipe the whole TT (not called automatically — kept in case we want
-// to flush between games).  The zero-init of g_tt already gives a clean start
-// at process load.
-static inline void tt_clear_all() {
-    std::memset(g_tt, 0, sizeof(g_tt));
-}
-
-static inline void tt_reset_counters() {
-    g_tt_probes = 0;
-    g_tt_hits = 0;
-    g_tt_stores = 0;
-    g_last_completed_depth = 0;
-}
-
-// =============================================================================
-// End [TT] additions — everything below is the same search logic, with small
-// integration hooks marked [TT] where they call into the table above.
-// =============================================================================
 
 static inline uint64_t cell_bit(int x, int y) {
     return 1ULL << (y * kBoardSize + x);
@@ -533,45 +364,12 @@ static float search_branch(
         return quiet_extension(state, alpha, beta, kQuietDepth, clock_state);
     }
 
-    // [TT] Save original alpha so we can classify the bound type on store.
-    const float orig_alpha = alpha;
-
-    // [TT] Probe the table.  Three possible outcomes:
-    //   (a) exact or matching-bound cached value at >= our depth -> return it
-    //   (b) entry exists but cannot prune -> use its best move for ordering
-    //   (c) no entry -> nothing special; fall through
-    const uint64_t hash = compute_hash(state);
-    EncodedMove tt_move{-1, -1, -1};
-    if (const TTEntry* entry = tt_probe(hash)) {
-        tt_move = entry->best;
-        if (entry->depth >= depth) {
-            if (entry->flag == kTTExact)                                 return entry->value;
-            if (entry->flag == kTTLower && entry->value >= beta)         return entry->value;
-            if (entry->flag == kTTUpper && entry->value <= alpha)        return entry->value;
-        }
-    }
-
     auto moves = collect_moves(state);
     if (moves.empty()) {
         return evaluate_position(state);
     }
 
-    // [TT] Move ordering: swap the TT-best move to the front if we have one.
-    // This is often a bigger win than the early-return, because trying the
-    // right move first lets alpha-beta cut off the rest.
-    if (tt_move.move_type >= 0) {
-        for (size_t i = 1; i < moves.size(); ++i) {
-            if (moves[i].move_type   == tt_move.move_type &&
-                moves[i].direction   == tt_move.direction &&
-                moves[i].roll_length == tt_move.roll_length) {
-                std::swap(moves[0], moves[i]);
-                break;
-            }
-        }
-    }
-
     float best = -std::numeric_limits<float>::infinity();
-    EncodedMove best_move = moves[0];    // [TT] Remember which move produced `best` for storing in the TT.
     int searched_count = 0;
 
     for (const auto& move : moves) {
@@ -602,7 +400,6 @@ static float search_branch(
         }
         if (score > best) {
             best = score;
-            best_move = move;               // [TT] Track best move.
         }
         if (score > alpha) {
             alpha = score;
@@ -612,15 +409,6 @@ static float search_branch(
         }
         ++searched_count;
     }
-
-    // [TT] Classify the result and store it.
-    //   best <= orig_alpha  -> we never exceeded the incoming alpha (fail-low)
-    //   best >= beta        -> we caused a beta cutoff              (fail-high)
-    //   else                -> exact minimax value
-    uint8_t flag = kTTExact;
-    if      (best <= orig_alpha) flag = kTTUpper;
-    else if (best >= beta)       flag = kTTLower;
-    tt_store(hash, depth, best, flag, best_move);
 
     return best;
 }
@@ -633,26 +421,6 @@ static bool evaluate_root_choices(
     RootChoice& out
 ) {
     auto moves = collect_moves(root);
-
-    // [TT] Use the TT's best move from prior iterative-deepening iterations
-    // as the first move to try at the root.  This is usually the previous
-    // iteration's best answer, which almost always stays best at the next
-    // depth and produces an immediate high alpha.
-    const uint64_t root_hash = compute_hash(root);
-    EncodedMove tt_move{-1, -1, -1};
-    if (const TTEntry* entry = tt_probe(root_hash)) {
-        tt_move = entry->best;
-    }
-    if (tt_move.move_type >= 0) {
-        for (size_t i = 0; i < moves.size(); ++i) {
-            if (moves[i].move_type   == tt_move.move_type &&
-                moves[i].direction   == tt_move.direction &&
-                moves[i].roll_length == tt_move.roll_length) {
-                std::swap(moves[0], moves[i]);
-                break;
-            }
-        }
-    }
 
     out.has_move = false;
     out.score = -kInfinityScore;
@@ -673,12 +441,6 @@ static bool evaluate_root_choices(
         return out.has_move;
     }
 
-    // [TT] Track the best *regular* (non-search) move separately so we can
-    // still store a useful move-ordering hint even if a rat-search move wins.
-    EncodedMove best_regular = moves[0];
-    float best_regular_score = -kInfinityScore;
-    bool have_regular = false;
-
     for (const auto& move : moves) {
         if (deadline_hit(clock_state)) {
             return false;
@@ -687,11 +449,6 @@ static bool evaluate_root_choices(
         float score = -search_branch(child, depth - 1, -beta, -alpha, clock_state);
         if (clock_state.timed_out) {
             return false;
-        }
-        if (!have_regular || score > best_regular_score) {
-            best_regular = move;
-            best_regular_score = score;
-            have_regular = true;
         }
         if (!out.has_move || score > out.score) {
             out.has_move = true;
@@ -703,14 +460,6 @@ static bool evaluate_root_choices(
         }
     }
 
-    // [TT] Store the best regular move at the root so the next ID iteration
-    // immediately picks it up as the first move to try.  We store the
-    // regular-move score (not a rat-search score) because the TT entry is
-    // about minimax-style board play, not the rat sub-game.
-    if (have_regular) {
-        tt_store(root_hash, depth, best_regular_score, kTTExact, best_regular);
-    }
-
     return out.has_move;
 }
 
@@ -718,9 +467,6 @@ static bool evaluate_root_choices(
 
 static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
     (void)self;
-
-    // [TT] Make sure Zobrist keys are filled before any hashing happens.
-    yolanda_ref::ensure_zobrist_ready();
 
     unsigned long long primed_mask;
     unsigned long long carpet_mask;
@@ -784,7 +530,6 @@ static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
             break;
         }
         best = current;
-        yolanda_ref::g_last_completed_depth = depth;
     }
 
     if (!best.has_move) {
@@ -800,43 +545,12 @@ static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
     );
 }
 
-static PyObject* tt_stats_entrypoint(PyObject* self, PyObject* args) {
-    (void)self;
-    (void)args;
-    return Py_BuildValue(
-        "(KKKi)",
-        yolanda_ref::g_tt_hits,
-        yolanda_ref::g_tt_probes,
-        yolanda_ref::g_tt_stores,
-        yolanda_ref::g_last_completed_depth
-    );
-}
-
-static PyObject* reset_tt_counters_entrypoint(PyObject* self, PyObject* args) {
-    (void)self;
-    (void)args;
-    yolanda_ref::tt_reset_counters();
-    Py_RETURN_NONE;
-}
-
 static PyMethodDef YolandaSearchMethods[] = {
     {
         "search",
         search_entrypoint,
         METH_VARARGS,
         "Native root search entrypoint for Yolanda."
-    },
-    {
-        "tt_stats",
-        tt_stats_entrypoint,
-        METH_NOARGS,
-        "Return TT (hits, probes, stores)."
-    },
-    {
-        "reset_tt_counters",
-        reset_tt_counters_entrypoint,
-        METH_NOARGS,
-        "Reset TT counters."
     },
     {nullptr, nullptr, 0, nullptr}
 };

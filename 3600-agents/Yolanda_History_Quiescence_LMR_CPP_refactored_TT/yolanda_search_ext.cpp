@@ -83,7 +83,7 @@ static constexpr int kSearchMoveType = 3;
 static constexpr int kStepX[4] = {0, 1, 0, -1};
 static constexpr int kStepY[4] = {-1, 0, 1, 0};
 static constexpr int kCarpetPoints[8] = {0, -1, 2, 4, 6, 10, 15, 21};
-static constexpr int kMaxDepth = 80;
+static constexpr int kMaxDepth = 40;
 static constexpr int kQuietDepth = 4;
 static constexpr float kSearchProbThreshold = 0.5f;
 static constexpr float kRatFindPoints = 4.0f;
@@ -180,7 +180,6 @@ static TTEntry g_tt[kTTSize];                // zero-initialized by the loader
 static uint64_t g_tt_probes = 0;
 static uint64_t g_tt_hits = 0;
 static uint64_t g_tt_stores = 0;
-static int g_last_completed_depth = 0;
 
 // Probe: return the entry if the key matches, else null.
 static inline const TTEntry* tt_probe(uint64_t key) {
@@ -220,7 +219,6 @@ static inline void tt_reset_counters() {
     g_tt_probes = 0;
     g_tt_hits = 0;
     g_tt_stores = 0;
-    g_last_completed_depth = 0;
 }
 
 // =============================================================================
@@ -784,7 +782,6 @@ static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
             break;
         }
         best = current;
-        yolanda_ref::g_last_completed_depth = depth;
     }
 
     if (!best.has_move) {
@@ -804,11 +801,10 @@ static PyObject* tt_stats_entrypoint(PyObject* self, PyObject* args) {
     (void)self;
     (void)args;
     return Py_BuildValue(
-        "(KKKi)",
+        "(KKK)",
         yolanda_ref::g_tt_hits,
         yolanda_ref::g_tt_probes,
-        yolanda_ref::g_tt_stores,
-        yolanda_ref::g_last_completed_depth
+        yolanda_ref::g_tt_stores
     );
 }
 

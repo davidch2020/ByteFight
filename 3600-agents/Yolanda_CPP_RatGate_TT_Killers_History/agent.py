@@ -56,29 +56,6 @@ _native_backend = _load_native_backend()
 _HAS_NATIVE = _native_backend is not None
 
 
-def _native_tt_stats():
-    """Return native stats as a compact tuple, or None if unavailable."""
-    if not _HAS_NATIVE or not hasattr(_native_backend, "tt_stats"):
-        return None
-    try:
-        stats = _native_backend.tt_stats()
-    except Exception:
-        return None
-    if not isinstance(stats, tuple) or len(stats) != 4:
-        return None
-    return int(stats[0]), int(stats[1]), int(stats[2]), int(stats[3])
-
-
-def _reset_native_tt_counters():
-    """Reset TT counters for a fresh agent instance when supported."""
-    if not _HAS_NATIVE or not hasattr(_native_backend, "reset_tt_counters"):
-        return
-    try:
-        _native_backend.reset_tt_counters()
-    except Exception:
-        pass
-
-
 def _encode_native_request(b, budget, belief):
     """Convert the Python board into a compact native request tuple."""
     pw = b.player_worker
@@ -385,19 +362,13 @@ class PlayerAgent:
         # Moves that caused cutoffs before get tried earlier later.
         self.history_scores = {}
         self.turn_number = 0
-        _reset_native_tt_counters()
 
     def commentate(self):
-        native_stats = _native_tt_stats()
-        if native_stats is not None:
-            hits, probes, stores, last = native_stats
-            rate = hits / probes if probes > 0 else 0.0
-            return f"S: {hits}/{probes} ({rate:.0%}), a={stores}, b={last}, c=1"
-
         t = self.tt
         total = t.hits + t.misses
         r = t.hits / total if total > 0 else 0
-        return f"S: {t.hits}/{total} ({r:.0%}), a={len(t.table)}, c=0"
+        mode = "CPP" if _HAS_NATIVE else "PY"
+        return f"{mode} | TT: {t.hits}/{total} ({r:.0%}), size={len(t.table)}"
 
     # ------------------------------------------------------------------
     # Entry

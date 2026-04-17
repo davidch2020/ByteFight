@@ -4,39 +4,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstring>   // [TT] memset for TT clear
 #include <limits>
-#include <random>    // [TT] mt19937_64 for Zobrist key seeding
+#include <unordered_map>
 #include <vector>
-
-// =============================================================================
-// HIGH-LEVEL OVERVIEW (where the changes are)
-// -----------------------------------------------------------------------------
-// This file is the same refactored search as before, with a Transposition Table
-// and Zobrist hashing added.  Every new / modified section is marked with [TT].
-//
-// What a TT does:
-//   1. Before searching a position, we hash the board to a 64-bit key and look
-//      up a cached result.  If the cached result was computed at >= our current
-//      depth and the alpha/beta bounds match, we return it immediately.  This
-//      prunes huge subtrees — the same positions often appear via different
-//      move orders ("transpositions").
-//   2. Even when the cached value is unusable (shallower depth), the entry
-//      still tells us the best move found last time.  We try that move first,
-//      which produces beta-cutoffs earlier and improves alpha-beta pruning.
-//
-// The Python side already had a TT.  This version puts it in the C++ path —
-// previously the C++ backend had no TT at all, which wasted a lot of work.
-//
-// New pieces added below:
-//   - Zobrist key arrays + `ensure_zobrist_ready()`   (seeded once per process)
-//   - `compute_hash()`                                (board state -> uint64)
-//   - `TTEntry` + fixed-size `g_tt` table             (1M entries, ~32 MB)
-//   - `tt_probe()` / `tt_store()`                     (depth-preferred replace)
-//   - TT probe/store + TT-hint move ordering in `search_branch` and
-//     `evaluate_root_choices`
-//   - `ensure_zobrist_ready()` called from `search_entrypoint`
-// =============================================================================
 
 namespace yolanda_ref {
 
@@ -83,150 +53,85 @@ static constexpr int kSearchMoveType = 3;
 static constexpr int kStepX[4] = {0, 1, 0, -1};
 static constexpr int kStepY[4] = {-1, 0, 1, 0};
 static constexpr int kCarpetPoints[8] = {0, -1, 2, 4, 6, 10, 15, 21};
-static constexpr int kMaxDepth = 80;
+static constexpr int kMaxDepth = 40;
 static constexpr int kQuietDepth = 4;
-static constexpr float kSearchProbThreshold = 0.5f;
+static constexpr int kKillerSlots = 2;
+static constexpr float kSearchProbThreshold = 1.0f / 3.0f;
 static constexpr float kRatFindPoints = 4.0f;
 static constexpr float kRatMissPoints = 2.0f;
 static constexpr float kInfinityScore = 1.0e9f;
 
-// =============================================================================
-// [TT] Transposition Table + Zobrist hashing
-// =============================================================================
-
-// One 64-bit random value per (feature, cell).  XOR-ing the values for every
-// feature present on the board gives a well-distributed 64-bit fingerprint of
-// the state.  These arrays are filled once at process start.
-static uint64_t zobrist_primed[64];
-static uint64_t zobrist_carpet[64];
-static uint64_t zobrist_ppos[64];
-static uint64_t zobrist_opos[64];
-static bool zobrist_initialized = false;
-
-// Fill the Zobrist tables once per process.  A deterministic seed means two
-// runs produce the same keys, which makes TT behavior reproducible.
-static void ensure_zobrist_ready() {
-    if (zobrist_initialized) return;
-    std::mt19937_64 rng(0xD3ADB33FULL);
-    for (int i = 0; i < 64; ++i) {
-        zobrist_primed[i] = rng();
-        zobrist_carpet[i] = rng();
-        zobrist_ppos[i]   = rng();
-        zobrist_opos[i]   = rng();
-    }
-    zobrist_initialized = true;
-}
-
-// Full hash recompute from a SearchState.  Simple, safe, ~15-30 ns per call.
-// Can be upgraded to an incremental XOR-in/XOR-out scheme later if needed.
-static uint64_t compute_hash(const SearchState& s) {
-    uint64_t h = 0;
-
-    // XOR in each set primed cell.
-    uint64_t p = s.primed_mask;
-    while (p) {
-        int bit = __builtin_ctzll(p);
-        h ^= zobrist_primed[bit];
-        p &= p - 1;
-    }
-    // XOR in each set carpet cell.
-    uint64_t c = s.carpet_mask;
-    while (c) {
-        int bit = __builtin_ctzll(c);
-        h ^= zobrist_carpet[bit];
-        c &= c - 1;
-    }
-    // Worker positions.  p_pos and o_pos live in separate arrays so "me at A,
-    // opp at B" hashes differently from "me at B, opp at A".
-    h ^= zobrist_ppos[s.py * 8 + s.px];
-    h ^= zobrist_opos[s.oy * 8 + s.ox];
-
-    // Scores and remaining turns affect the evaluation, so they must be part
-    // of the key — two otherwise-identical boards with different scores are
-    // different search states.  We use simple large-prime multipliers to mix.
-    h ^= uint64_t(s.p_points) * 0x9E3779B97F4A7C15ULL;
-    h ^= uint64_t(s.o_points) * 0xBF58476D1CE4E5B9ULL;
-    h ^= uint64_t(s.p_turns)  * 0x94D049BB133111EBULL;
-    h ^= uint64_t(s.o_turns)  * 0xD1B54A32D192ED03ULL;
-    return h;
-}
-
-// Bound classification for the stored value.
-//   EXACT = the true minimax score
-//   LOWER = a lower bound (fail-high: true score >= value)
-//   UPPER = an upper bound (fail-low:  true score <= value)
-static constexpr uint8_t kTTExact = 0;
-static constexpr uint8_t kTTLower = 1;
-static constexpr uint8_t kTTUpper = 2;
-
-// A TT slot.  Laid out small so we pack cache lines reasonably.
 struct TTEntry {
-    uint64_t    key;    // Zobrist hash.  key == 0 is the "empty slot" sentinel.
-    float       value;  // Stored score from the side-to-move's perspective.
-    EncodedMove best;   // Best move found at this position (for ordering).
-    int16_t     depth;  // Search depth used to produce `value`.
-    uint8_t     flag;   // EXACT / LOWER / UPPER.
-    uint8_t     _pad;
+    int depth;
+    float value;
+    EncodedMove best_move;
+    int node_type;  // 0 = exact, 1 = lower bound, 2 = upper bound
 };
 
-// Fixed-size table.  Power-of-two size lets us index with a bit mask
-// instead of %.  No heap allocation during search.
-static constexpr size_t kTTSize = 1 << 20;   // 1M entries
-static constexpr size_t kTTMask = kTTSize - 1;
-static TTEntry g_tt[kTTSize];                // zero-initialized by the loader
+struct BoardKey {
+    uint64_t primed_mask;
+    uint64_t carpet_mask;
+    uint64_t blocked_mask;
+    uint8_t px;
+    uint8_t py;
+    uint8_t ox;
+    uint8_t oy;
+    int16_t p_points;
+    int16_t o_points;
+    int8_t p_turns;
+    int8_t o_turns;
 
-// Instrumentation counters so the Python side can report TT activity.
-// These do not affect search behavior.
-static uint64_t g_tt_probes = 0;
-static uint64_t g_tt_hits = 0;
-static uint64_t g_tt_stores = 0;
-static int g_last_completed_depth = 0;
-
-// Probe: return the entry if the key matches, else null.
-static inline const TTEntry* tt_probe(uint64_t key) {
-    ++g_tt_probes;
-    const TTEntry& e = g_tt[key & kTTMask];
-    if (e.key == key) {
-        ++g_tt_hits;
-        return &e;
+    bool operator==(const BoardKey& other) const {
+        return primed_mask == other.primed_mask &&
+               carpet_mask == other.carpet_mask &&
+               blocked_mask == other.blocked_mask &&
+               px == other.px &&
+               py == other.py &&
+               ox == other.ox &&
+               oy == other.oy &&
+               p_points == other.p_points &&
+               o_points == other.o_points &&
+               p_turns == other.p_turns &&
+               o_turns == other.o_turns;
     }
-    return nullptr;
-}
+};
 
-// Store: depth-preferred replacement.  We only overwrite an existing slot if
-// the new result was searched at least as deep — this protects expensive
-// deep-search results from being clobbered by cheap shallow probes.
-static inline void tt_store(uint64_t key, int depth, float value,
-                            uint8_t flag, EncodedMove best) {
-    TTEntry& e = g_tt[key & kTTMask];
-    if (e.key != key || e.depth <= depth) {
-        ++g_tt_stores;
-        e.key   = key;
-        e.depth = static_cast<int16_t>(depth);
-        e.flag  = flag;
-        e.best  = best;
-        e.value = value;
+struct BoardKeyHash {
+    std::size_t operator()(const BoardKey& key) const {
+        // Mix the compact board fields into one hash for the native TT.
+        std::size_t h = std::hash<uint64_t>{}(key.primed_mask);
+        h ^= std::hash<uint64_t>{}(key.carpet_mask) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint64_t>{}(key.blocked_mask) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>{}(
+            uint32_t(key.px) | (uint32_t(key.py) << 8) |
+            (uint32_t(key.ox) << 16) | (uint32_t(key.oy) << 24)
+        ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>{}(
+            uint32_t(uint16_t(key.p_points)) | (uint32_t(uint16_t(key.o_points)) << 16)
+        ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint16_t>{}(
+            uint16_t(uint8_t(key.p_turns)) | (uint16_t(uint8_t(key.o_turns)) << 8)
+        ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
-}
+};
 
-// Optional: wipe the whole TT (not called automatically — kept in case we want
-// to flush between games).  The zero-init of g_tt already gives a clean start
-// at process load.
-static inline void tt_clear_all() {
-    std::memset(g_tt, 0, sizeof(g_tt));
-}
+struct SearchTables {
+    // Native transposition table: search memory for already-seen boards.
+    std::unordered_map<BoardKey, TTEntry, BoardKeyHash> tt;
 
-static inline void tt_reset_counters() {
-    g_tt_probes = 0;
-    g_tt_hits = 0;
-    g_tt_stores = 0;
-    g_last_completed_depth = 0;
-}
+    // Killer moves: two strong cutoff-causing moves remembered per depth.
+    EncodedMove killers[kMaxDepth + 1][kKillerSlots]{};
+    bool has_killer[kMaxDepth + 1][kKillerSlots]{};
 
-// =============================================================================
-// End [TT] additions — everything below is the same search logic, with small
-// integration hooks marked [TT] where they call into the table above.
-// =============================================================================
+    // History heuristic: how often a move caused a cutoff before.
+    int history[4][8][4]{};
+};
+
+struct SearchContext {
+    DeadlineState clock;
+    SearchTables tables;
+};
 
 static inline uint64_t cell_bit(int x, int y) {
     return 1ULL << (y * kBoardSize + x);
@@ -249,6 +154,135 @@ static inline bool deadline_hit(DeadlineState& clock_state) {
         return true;
     }
     return false;
+}
+
+static BoardKey make_board_key(const SearchState& state) {
+    return BoardKey{
+        state.primed_mask,
+        state.carpet_mask,
+        state.blocked_mask,
+        uint8_t(state.px), uint8_t(state.py),
+        uint8_t(state.ox), uint8_t(state.oy),
+        int16_t(state.p_points), int16_t(state.o_points),
+        int8_t(state.p_turns), int8_t(state.o_turns),
+    };
+}
+
+static bool same_move(const EncodedMove& lhs, const EncodedMove& rhs) {
+    return lhs.move_type == rhs.move_type &&
+           lhs.direction == rhs.direction &&
+           lhs.roll_length == rhs.roll_length;
+}
+
+static int move_roll_slot(const EncodedMove& move) {
+    return move.move_type == kCarpetMoveType ? std::min(move.roll_length, 7) : 0;
+}
+
+static int history_score(const SearchTables& tables, const EncodedMove& move) {
+    return tables.history[move.move_type][move_roll_slot(move)][move.direction];
+}
+
+static int killer_rank(const SearchTables& tables, int depth, const EncodedMove& move) {
+    if (depth < 0 || depth > kMaxDepth) {
+        return kKillerSlots;
+    }
+    for (int slot = 0; slot < kKillerSlots; ++slot) {
+        if (tables.has_killer[depth][slot] && same_move(tables.killers[depth][slot], move)) {
+            return slot;
+        }
+    }
+    return kKillerSlots;
+}
+
+static void add_killer(SearchTables& tables, int depth, const EncodedMove& move) {
+    // Remember moves that caused a cutoff, so we try them early later.
+    if (depth < 0 || depth > kMaxDepth) {
+        return;
+    }
+    if (tables.has_killer[depth][0] && same_move(tables.killers[depth][0], move)) {
+        return;
+    }
+    if (!tables.has_killer[depth][0]) {
+        tables.killers[depth][0] = move;
+        tables.has_killer[depth][0] = true;
+        return;
+    }
+    tables.killers[depth][1] = tables.killers[depth][0];
+    tables.has_killer[depth][1] = tables.has_killer[depth][0];
+    tables.killers[depth][0] = move;
+    tables.has_killer[depth][0] = true;
+}
+
+static void add_history(SearchTables& tables, const EncodedMove& move, int depth) {
+    // Reward moves that keep causing cutoffs. Deeper cutoffs matter more.
+    tables.history[move.move_type][move_roll_slot(move)][move.direction] += depth * depth;
+}
+
+static bool tt_lookup(
+    SearchTables& tables,
+    const BoardKey& key,
+    int depth,
+    float alpha,
+    float beta,
+    float& out_value,
+    EncodedMove* out_hint,
+    bool* out_has_hint
+) {
+    if (out_has_hint != nullptr) {
+        *out_has_hint = false;
+    }
+
+    auto it = tables.tt.find(key);
+    if (it == tables.tt.end()) {
+        return false;
+    }
+
+    const TTEntry& entry = it->second;
+    if (out_hint != nullptr) {
+        *out_hint = entry.best_move;
+    }
+    if (out_has_hint != nullptr) {
+        *out_has_hint = true;
+    }
+
+    if (entry.depth < depth) {
+        return false;
+    }
+    if (entry.node_type == 0) {
+        out_value = entry.value;
+        return true;
+    }
+    if (entry.node_type == 1 && entry.value >= beta) {
+        out_value = entry.value;
+        return true;
+    }
+    if (entry.node_type == 2 && entry.value <= alpha) {
+        out_value = entry.value;
+        return true;
+    }
+    return false;
+}
+
+static void tt_store(
+    SearchTables& tables,
+    const BoardKey& key,
+    int depth,
+    float value,
+    const EncodedMove& best_move,
+    float orig_alpha,
+    float beta
+) {
+    int node_type = 0;
+    if (value <= orig_alpha) {
+        node_type = 2;
+    } else if (value >= beta) {
+        node_type = 1;
+    }
+
+    auto it = tables.tt.find(key);
+    if (it == tables.tt.end() || depth >= it->second.depth) {
+        tables.tt[key] = TTEntry{depth, value, best_move, node_type};
+    }
 }
 
 static int best_carpet_value(
@@ -291,6 +325,67 @@ static int adjacent_prime_count(const SearchState& state, int x, int y) {
         }
     }
     return adjacent;
+}
+
+static float threatened_run_value(const SearchState& state) {
+    // If the opponent is near the far end of our best run, board play gets more urgent.
+    float best_threat = 0.0f;
+    uint64_t workers_mask = cell_bit(state.px, state.py) | cell_bit(state.ox, state.oy);
+
+    for (int direction = 0; direction < 4; ++direction) {
+        int run = 0;
+        int x = state.px;
+        int y = state.py;
+        int far_x = state.px;
+        int far_y = state.py;
+
+        while (run < 7) {
+            int nx = x + kStepX[direction];
+            int ny = y + kStepY[direction];
+            if (!inside_board(nx, ny)) {
+                break;
+            }
+
+            uint64_t bit = cell_bit(nx, ny);
+            if ((state.primed_mask & bit) == 0 || (workers_mask & bit) != 0) {
+                break;
+            }
+
+            ++run;
+            far_x = nx;
+            far_y = ny;
+            x = nx;
+            y = ny;
+        }
+
+        if (run < 2) {
+            continue;
+        }
+
+        int dx = state.ox > far_x ? state.ox - far_x : far_x - state.ox;
+        int dy = state.oy > far_y ? state.oy - far_y : far_y - state.oy;
+        if (dx + dy <= 1) {
+            best_threat = std::max(best_threat, float(kCarpetPoints[run]));
+        }
+    }
+
+    return best_threat;
+}
+
+static float search_barrier(const SearchState& state) {
+    // Rat search should beat the board value we are giving up.
+    float my_carpet = float(best_carpet_value(state, state.px, state.py, state.ox, state.oy));
+    float threshold = (my_carpet < 1.0f) ? 0.5f : my_carpet;
+
+    float steal_threat = threatened_run_value(state);
+    if (steal_threat > 0.0f) {
+        threshold += 0.5f * steal_threat;
+    }
+
+    if (state.p_turns <= 5) {
+        threshold = std::max(0.5f, threshold - 1.0f);
+    }
+    return threshold;
 }
 
 static float evaluate_position(const SearchState& state) {
@@ -381,11 +476,72 @@ static void sort_candidates(std::vector<EncodedMove>& moves) {
     });
 }
 
+static void sort_search_candidates(
+    std::vector<EncodedMove>& moves,
+    const SearchTables& tables,
+    int depth,
+    const EncodedMove* tt_hint
+) {
+    std::sort(moves.begin(), moves.end(), [&](const EncodedMove& lhs, const EncodedMove& rhs) {
+        // TT move first: if the TT already liked a move here, try it first.
+        bool lhs_tt = tt_hint != nullptr && same_move(lhs, *tt_hint);
+        bool rhs_tt = tt_hint != nullptr && same_move(rhs, *tt_hint);
+        if (lhs_tt != rhs_tt) {
+            return lhs_tt;
+        }
+
+        // Killer moves next: these caused cutoffs before at this same depth.
+        int lhs_killer = killer_rank(tables, depth, lhs);
+        int rhs_killer = killer_rank(tables, depth, rhs);
+        if (lhs_killer != rhs_killer) {
+            return lhs_killer < rhs_killer;
+        }
+
+        int lhs_bucket = candidate_bucket(lhs);
+        int rhs_bucket = candidate_bucket(rhs);
+        if (lhs_bucket != rhs_bucket) {
+            return lhs_bucket < rhs_bucket;
+        }
+
+        if (lhs.move_type == kCarpetMoveType && rhs.move_type == kCarpetMoveType) {
+            // Match the Python path: longer carpets still matter most.
+            if (lhs.roll_length != rhs.roll_length) {
+                return lhs.roll_length > rhs.roll_length;
+            }
+        }
+
+        // Within a move bucket, try moves that caused more cutoffs first.
+        int lhs_hist = history_score(tables, lhs);
+        int rhs_hist = history_score(tables, rhs);
+        if (lhs_hist != rhs_hist) {
+            return lhs_hist > rhs_hist;
+        }
+
+        if (lhs.direction != rhs.direction) {
+            return lhs.direction < rhs.direction;
+        }
+        return lhs.roll_length > rhs.roll_length;
+    });
+}
+
 static std::vector<EncodedMove> collect_moves(const SearchState& state) {
     std::vector<EncodedMove> moves;
     append_step_moves(state, moves);
     append_carpet_moves(state, moves);
     sort_candidates(moves);
+    return moves;
+}
+
+static std::vector<EncodedMove> collect_search_moves(
+    const SearchState& state,
+    const SearchTables& tables,
+    int depth,
+    const EncodedMove* tt_hint
+) {
+    std::vector<EncodedMove> moves;
+    append_step_moves(state, moves);
+    append_carpet_moves(state, moves);
+    sort_search_candidates(moves, tables, depth, tt_hint);
     return moves;
 }
 
@@ -464,8 +620,8 @@ static bool select_search_option(
 
     float ev = kRatFindPoints * static_cast<float>(probability) -
                kRatMissPoints * (1.0f - static_cast<float>(probability));
-    int board_cost = best_carpet_value(state, state.px, state.py, state.ox, state.oy);
-    if (board_cost > ev + 2.0f || ev <= 0.0f) {
+    float threshold = search_barrier(state);
+    if (ev < threshold || ev <= 0.0f) {
         return false;
     }
 
@@ -480,9 +636,9 @@ static float quiet_extension(
     float alpha,
     float beta,
     int quiet_depth,
-    DeadlineState& clock_state
+    SearchContext& ctx
 ) {
-    if (deadline_hit(clock_state)) {
+    if (deadline_hit(ctx.clock)) {
         return 0.0f;
     }
 
@@ -504,8 +660,8 @@ static float quiet_extension(
             continue;
         }
         SearchState child = advance_and_swap(state, move);
-        float score = -quiet_extension(child, -beta, -alpha, quiet_depth - 1, clock_state);
-        if (clock_state.timed_out) {
+        float score = -quiet_extension(child, -beta, -alpha, quiet_depth - 1, ctx);
+        if (ctx.clock.timed_out) {
             return 0.0f;
         }
         if (score >= beta) {
@@ -523,59 +679,36 @@ static float search_branch(
     int depth,
     float alpha,
     float beta,
-    DeadlineState& clock_state
+    SearchContext& ctx
 ) {
-    if (deadline_hit(clock_state)) {
+    if (deadline_hit(ctx.clock)) {
         return 0.0f;
     }
 
     if (depth <= 0 || state.p_turns <= 0) {
-        return quiet_extension(state, alpha, beta, kQuietDepth, clock_state);
+        return quiet_extension(state, alpha, beta, kQuietDepth, ctx);
     }
 
-    // [TT] Save original alpha so we can classify the bound type on store.
-    const float orig_alpha = alpha;
-
-    // [TT] Probe the table.  Three possible outcomes:
-    //   (a) exact or matching-bound cached value at >= our depth -> return it
-    //   (b) entry exists but cannot prune -> use its best move for ordering
-    //   (c) no entry -> nothing special; fall through
-    const uint64_t hash = compute_hash(state);
-    EncodedMove tt_move{-1, -1, -1};
-    if (const TTEntry* entry = tt_probe(hash)) {
-        tt_move = entry->best;
-        if (entry->depth >= depth) {
-            if (entry->flag == kTTExact)                                 return entry->value;
-            if (entry->flag == kTTLower && entry->value >= beta)         return entry->value;
-            if (entry->flag == kTTUpper && entry->value <= alpha)        return entry->value;
-        }
+    BoardKey key = make_board_key(state);
+    float tt_value = 0.0f;
+    EncodedMove tt_hint{};
+    bool has_tt_hint = false;
+    if (tt_lookup(ctx.tables, key, depth, alpha, beta, tt_value, &tt_hint, &has_tt_hint)) {
+        return tt_value;
     }
 
-    auto moves = collect_moves(state);
+    auto moves = collect_search_moves(state, ctx.tables, depth, has_tt_hint ? &tt_hint : nullptr);
     if (moves.empty()) {
         return evaluate_position(state);
     }
 
-    // [TT] Move ordering: swap the TT-best move to the front if we have one.
-    // This is often a bigger win than the early-return, because trying the
-    // right move first lets alpha-beta cut off the rest.
-    if (tt_move.move_type >= 0) {
-        for (size_t i = 1; i < moves.size(); ++i) {
-            if (moves[i].move_type   == tt_move.move_type &&
-                moves[i].direction   == tt_move.direction &&
-                moves[i].roll_length == tt_move.roll_length) {
-                std::swap(moves[0], moves[i]);
-                break;
-            }
-        }
-    }
-
     float best = -std::numeric_limits<float>::infinity();
-    EncodedMove best_move = moves[0];    // [TT] Remember which move produced `best` for storing in the TT.
+    float orig_alpha = alpha;
     int searched_count = 0;
+    EncodedMove best_move = moves.front();
 
     for (const auto& move : moves) {
-        if (deadline_hit(clock_state)) {
+        if (deadline_hit(ctx.clock)) {
             return 0.0f;
         }
 
@@ -589,39 +722,34 @@ static float search_branch(
             move.move_type == kPlainMoveType
         );
         if (use_lmr) {
-            score = -search_branch(child, depth - 2, -(alpha + 1.0f), -alpha, clock_state);
-            if (!clock_state.timed_out && score > alpha) {
-                score = -search_branch(child, depth - 1, -beta, -alpha, clock_state);
+            score = -search_branch(child, depth - 2, -(alpha + 1.0f), -alpha, ctx);
+            if (!ctx.clock.timed_out && score > alpha) {
+                score = -search_branch(child, depth - 1, -beta, -alpha, ctx);
             }
         } else {
-            score = -search_branch(child, depth - 1, -beta, -alpha, clock_state);
+            score = -search_branch(child, depth - 1, -beta, -alpha, ctx);
         }
 
-        if (clock_state.timed_out) {
+        if (ctx.clock.timed_out) {
             return 0.0f;
         }
         if (score > best) {
             best = score;
-            best_move = move;               // [TT] Track best move.
+            best_move = move;
         }
         if (score > alpha) {
             alpha = score;
         }
         if (alpha >= beta) {
+            // A cutoff means this move is worth remembering globally.
+            add_killer(ctx.tables, depth, move);
+            add_history(ctx.tables, move, depth);
             break;
         }
         ++searched_count;
     }
 
-    // [TT] Classify the result and store it.
-    //   best <= orig_alpha  -> we never exceeded the incoming alpha (fail-low)
-    //   best >= beta        -> we caused a beta cutoff              (fail-high)
-    //   else                -> exact minimax value
-    uint8_t flag = kTTExact;
-    if      (best <= orig_alpha) flag = kTTUpper;
-    else if (best >= beta)       flag = kTTLower;
-    tt_store(hash, depth, best, flag, best_move);
-
+    tt_store(ctx.tables, key, depth, best, best_move, orig_alpha, beta);
     return best;
 }
 
@@ -629,30 +757,16 @@ static bool evaluate_root_choices(
     const SearchState& root,
     const std::vector<double>& belief,
     int depth,
-    DeadlineState& clock_state,
+    SearchContext& ctx,
     RootChoice& out
 ) {
-    auto moves = collect_moves(root);
+    BoardKey key = make_board_key(root);
+    float ignored = 0.0f;
+    EncodedMove tt_hint{};
+    bool has_tt_hint = false;
+    tt_lookup(ctx.tables, key, depth, -kInfinityScore, kInfinityScore, ignored, &tt_hint, &has_tt_hint);
 
-    // [TT] Use the TT's best move from prior iterative-deepening iterations
-    // as the first move to try at the root.  This is usually the previous
-    // iteration's best answer, which almost always stays best at the next
-    // depth and produces an immediate high alpha.
-    const uint64_t root_hash = compute_hash(root);
-    EncodedMove tt_move{-1, -1, -1};
-    if (const TTEntry* entry = tt_probe(root_hash)) {
-        tt_move = entry->best;
-    }
-    if (tt_move.move_type >= 0) {
-        for (size_t i = 0; i < moves.size(); ++i) {
-            if (moves[i].move_type   == tt_move.move_type &&
-                moves[i].direction   == tt_move.direction &&
-                moves[i].roll_length == tt_move.roll_length) {
-                std::swap(moves[0], moves[i]);
-                break;
-            }
-        }
-    }
+    auto moves = collect_search_moves(root, ctx.tables, depth, has_tt_hint ? &tt_hint : nullptr);
 
     out.has_move = false;
     out.score = -kInfinityScore;
@@ -673,25 +787,14 @@ static bool evaluate_root_choices(
         return out.has_move;
     }
 
-    // [TT] Track the best *regular* (non-search) move separately so we can
-    // still store a useful move-ordering hint even if a rat-search move wins.
-    EncodedMove best_regular = moves[0];
-    float best_regular_score = -kInfinityScore;
-    bool have_regular = false;
-
     for (const auto& move : moves) {
-        if (deadline_hit(clock_state)) {
+        if (deadline_hit(ctx.clock)) {
             return false;
         }
         SearchState child = advance_and_swap(root, move);
-        float score = -search_branch(child, depth - 1, -beta, -alpha, clock_state);
-        if (clock_state.timed_out) {
+        float score = -search_branch(child, depth - 1, -beta, -alpha, ctx);
+        if (ctx.clock.timed_out) {
             return false;
-        }
-        if (!have_regular || score > best_regular_score) {
-            best_regular = move;
-            best_regular_score = score;
-            have_regular = true;
         }
         if (!out.has_move || score > out.score) {
             out.has_move = true;
@@ -703,14 +806,6 @@ static bool evaluate_root_choices(
         }
     }
 
-    // [TT] Store the best regular move at the root so the next ID iteration
-    // immediately picks it up as the first move to try.  We store the
-    // regular-move score (not a rat-search score) because the TT entry is
-    // about minimax-style board play, not the rat sub-game.
-    if (have_regular) {
-        tt_store(root_hash, depth, best_regular_score, kTTExact, best_regular);
-    }
-
     return out.has_move;
 }
 
@@ -718,9 +813,6 @@ static bool evaluate_root_choices(
 
 static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
     (void)self;
-
-    // [TT] Make sure Zobrist keys are filled before any hashing happens.
-    yolanda_ref::ensure_zobrist_ready();
 
     unsigned long long primed_mask;
     unsigned long long carpet_mask;
@@ -766,12 +858,12 @@ static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
     };
 
     double safe_budget = std::max(0.01, budget - 0.01);
-    yolanda_ref::DeadlineState clock_state{};
-    clock_state.deadline = std::chrono::steady_clock::now() +
+    yolanda_ref::SearchContext ctx{};
+    ctx.clock.deadline = std::chrono::steady_clock::now() +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(safe_budget)
         );
-    clock_state.timed_out = false;
+    ctx.clock.timed_out = false;
 
     yolanda_ref::RootChoice best{
         false,
@@ -780,11 +872,10 @@ static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
     };
     for (int depth = 1; depth <= yolanda_ref::kMaxDepth; ++depth) {
         yolanda_ref::RootChoice current{};
-        if (!yolanda_ref::evaluate_root_choices(root, belief, depth, clock_state, current)) {
+        if (!yolanda_ref::evaluate_root_choices(root, belief, depth, ctx, current)) {
             break;
         }
         best = current;
-        yolanda_ref::g_last_completed_depth = depth;
     }
 
     if (!best.has_move) {
@@ -800,43 +891,12 @@ static PyObject* search_entrypoint(PyObject* self, PyObject* args) {
     );
 }
 
-static PyObject* tt_stats_entrypoint(PyObject* self, PyObject* args) {
-    (void)self;
-    (void)args;
-    return Py_BuildValue(
-        "(KKKi)",
-        yolanda_ref::g_tt_hits,
-        yolanda_ref::g_tt_probes,
-        yolanda_ref::g_tt_stores,
-        yolanda_ref::g_last_completed_depth
-    );
-}
-
-static PyObject* reset_tt_counters_entrypoint(PyObject* self, PyObject* args) {
-    (void)self;
-    (void)args;
-    yolanda_ref::tt_reset_counters();
-    Py_RETURN_NONE;
-}
-
 static PyMethodDef YolandaSearchMethods[] = {
     {
         "search",
         search_entrypoint,
         METH_VARARGS,
         "Native root search entrypoint for Yolanda."
-    },
-    {
-        "tt_stats",
-        tt_stats_entrypoint,
-        METH_NOARGS,
-        "Return TT (hits, probes, stores)."
-    },
-    {
-        "reset_tt_counters",
-        reset_tt_counters_entrypoint,
-        METH_NOARGS,
-        "Reset TT counters."
     },
     {nullptr, nullptr, 0, nullptr}
 };
