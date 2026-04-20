@@ -84,7 +84,7 @@ static constexpr int kStepX[4] = {0, 1, 0, -1};
 static constexpr int kStepY[4] = {-1, 0, 1, 0};
 static constexpr int kCarpetPoints[8] = {0, -1, 2, 4, 6, 10, 15, 21};
 static constexpr int kMaxDepth = 80;
-static constexpr int kQuietDepth = 6;
+static constexpr int kQuietDepth = 4;
 static constexpr float kSearchProbThreshold = 0.5f;
 static constexpr float kRatFindPoints = 4.0f;
 static constexpr float kRatMissPoints = 2.0f;
@@ -181,10 +181,6 @@ static uint64_t g_tt_probes = 0;
 static uint64_t g_tt_hits = 0;
 static uint64_t g_tt_stores = 0;
 static int g_last_completed_depth = 0;
-static uint64_t g_q_calls = 0;
-static uint64_t g_q_moves = 0;
-static uint64_t g_q_cutoffs = 0;
-static int g_q_max_ply = 0;
 
 // Probe: return the entry if the key matches, else null.
 static inline const TTEntry* tt_probe(uint64_t key) {
@@ -225,10 +221,6 @@ static inline void tt_reset_counters() {
     g_tt_hits = 0;
     g_tt_stores = 0;
     g_last_completed_depth = 0;
-    g_q_calls = 0;
-    g_q_moves = 0;
-    g_q_cutoffs = 0;
-    g_q_max_ply = 0;
 }
 
 // =============================================================================
@@ -397,33 +389,6 @@ static std::vector<EncodedMove> collect_moves(const SearchState& state) {
     return moves;
 }
 
-static std::vector<EncodedMove> collect_quiet_moves(const SearchState& state) {
-    std::vector<EncodedMove> moves;
-    append_carpet_moves(state, moves);
-
-    // Q-search only cares about meaningful carpet tactics.
-    moves.erase(
-        std::remove_if(
-            moves.begin(),
-            moves.end(),
-            [](const EncodedMove& move) {
-                return move.move_type != kCarpetMoveType || move.roll_length < 2;
-            }
-        ),
-        moves.end()
-    );
-
-    // Try the biggest tactical swings first.
-    std::sort(moves.begin(), moves.end(), [](const EncodedMove& lhs, const EncodedMove& rhs) {
-        if (lhs.roll_length != rhs.roll_length) {
-            return lhs.roll_length > rhs.roll_length;
-        }
-        return lhs.direction < rhs.direction;
-    });
-
-    return moves;
-}
-
 static SearchState advance_and_swap(const SearchState& state, const EncodedMove& move) {
     SearchState next = state;
 
@@ -517,16 +482,8 @@ static float quiet_extension(
     int quiet_depth,
     DeadlineState& clock_state
 ) {
-    ++g_q_calls;
-    g_q_max_ply = std::max(g_q_max_ply, kQuietDepth - quiet_depth);
-
     if (deadline_hit(clock_state)) {
         return 0.0f;
-    }
-
-    // No normal plies remain, so just stand pat from here.
-    if (state.p_turns <= 0) {
-        return evaluate_position(state);
     }
 
     float stand_pat = evaluate_position(state);
@@ -540,16 +497,18 @@ static float quiet_extension(
         return alpha;
     }
 
-    auto moves = collect_quiet_moves(state);
+    auto moves = collect_moves(state);
     for (const auto& move : moves) {
-        ++g_q_moves;
+        // Extend only meaningful carpet tactics.
+        if (move.move_type != kCarpetMoveType || move.roll_length < 2) {
+            continue;
+        }
         SearchState child = advance_and_swap(state, move);
         float score = -quiet_extension(child, -beta, -alpha, quiet_depth - 1, clock_state);
         if (clock_state.timed_out) {
             return 0.0f;
         }
         if (score >= beta) {
-            ++g_q_cutoffs;
             return beta;
         }
         if (score > alpha) {
@@ -845,15 +804,11 @@ static PyObject* tt_stats_entrypoint(PyObject* self, PyObject* args) {
     (void)self;
     (void)args;
     return Py_BuildValue(
-        "(KKKiKKKi)",
+        "(KKKi)",
         yolanda_ref::g_tt_hits,
         yolanda_ref::g_tt_probes,
         yolanda_ref::g_tt_stores,
-        yolanda_ref::g_last_completed_depth,
-        yolanda_ref::g_q_calls,
-        yolanda_ref::g_q_moves,
-        yolanda_ref::g_q_cutoffs,
-        yolanda_ref::g_q_max_ply
+        yolanda_ref::g_last_completed_depth
     );
 }
 

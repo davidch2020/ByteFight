@@ -64,9 +64,9 @@ def _native_tt_stats():
         stats = _native_backend.tt_stats()
     except Exception:
         return None
-    if not isinstance(stats, tuple) or len(stats) != 8:
+    if not isinstance(stats, tuple) or len(stats) != 4:
         return None
-    return tuple(int(x) for x in stats)
+    return int(stats[0]), int(stats[1]), int(stats[2]), int(stats[3])
 
 
 def _reset_native_tt_counters():
@@ -390,13 +390,9 @@ class PlayerAgent:
     def commentate(self):
         native_stats = _native_tt_stats()
         if native_stats is not None:
-            hits, probes, stores, last, qcalls, qmoves, qcuts, qply = native_stats
+            hits, probes, stores, last = native_stats
             rate = hits / probes if probes > 0 else 0.0
-            return (
-                f"S: {hits}/{probes} ({rate:.0%}), "
-                f"a={stores}, b={last}, d={qcalls}, e={qmoves}, "
-                f"f={qcuts}, g={qply}, c=1"
-            )
+            return f"S: {hits}/{probes} ({rate:.0%}), a={stores}, b={last}, c=1"
 
         t = self.tt
         total = t.hits + t.misses
